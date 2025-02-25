@@ -67,7 +67,7 @@ def _translate_single(text: str, keyword: str = "", max_retries=3) -> dict:
    Do not translate entity names, or brands. For example, always use "Bitcoin" (not a translated equivalent) and keep all other technical terms and entities in English. This includes cryptocurrency names, blockchain terms, etc. Keep Technical terms in English but explain it in the way that is easier to understand via Thai. For example "Market intelligence - ฟีเจอร์วิเคราะห์ตลาดที่ช่วยให้ข้อมูลเชิงลึกสำหรับการตัดสินใจทางการเงิน"
 
 4. Translate *ALL* Visible Texts.
-   You *must* translate *all* visible text into Thai *without exception*, unless it falls under rule #3 (technical terms/brands). This includes *everything* inside h2, h3, paragraphs, list items, table cells, button text, *and especially text within `<span>` and anchor text in hyperlink tags, no matter where they appear*. Double-check to ensure *every* piece of translatable text is translated into Thai. *There should be NO English text remaining in the translation except for the exceptions outlined in rule #3.*
+   You *must* translate *all* visible text into Thai *without exception*, unless it falls under rule #3 (technical terms/brands). This includes *everything* inside h2, h3, paragraphs, list items, table cells, button text, *and especially text within `<span>` and anchor text in hyperlink tags, no matter where they appear*. Double-check to ensure *every* piece of translatable text is translated into Thai. *There should be NO English or another language text remaining in the translation except for the exceptions outlined in rule #3.*
 
 5. Modify Only These Specific Links to the Thai Variant
    If you encounter *only* these specific links (with or without "/en" after the domain), change them to use "/th" instead:
@@ -83,7 +83,7 @@ def _translate_single(text: str, keyword: str = "", max_retries=3) -> dict:
 6. Ensure Proper Spacing and Punctuation
    Translate the visible text content to Thai while strictly following Thai orthographic and typographic conventions. Make sure no extra spaces or punctuation errors are introduced. Insert appropriate spacing where needed between Thai and any English words or technical terms. If there are English words in Thai sentences, ensure they are written in title case. For example: Exchange แบบ Non-Custodial ผู้ใช้จะได้รับ Private Keys ของตน. 
 
-   Avoid word-for-word translation. You must ensure the sentence is correct and resonates with Thai Crypto readers. If needed, you can adjust the position of HTML tags to allow for active (direct) sentence structures rather than passive ones that may originate from the original English sentences.
+   Avoid word-for-word translation. You must ensure the sentence is correct and resonates with Thai Crypto readers. If needed, you can adjust the position of HTML tags to allow for active (direct) sentence structures rather than passive ones that may originate from the original language sentences.
 
 7. Do not add or remove wrapper tags (like <!DOCTYPE html>, <html>, <head>, or <body>) unless they already exist in the snippet.
 
@@ -396,7 +396,7 @@ with st.expander("Translation Guidelines", expanded=False):
     3. **Maintains English technical terms** - Crypto terminology stays in English
     4. **Translates all visible text** - Including spans and anchor text
     5. **Modifies specific links** - Changes select domains to Thai versions
-    6. **Ensures proper Thai spacing and punctuation** - Following Thai conventions
+    6. **Ensures proper Thai spacing and punctuation** .
     7. **Preserves document structure** - No wrapper tags added or removed
     8. **Keyword targeting** - Includes specified keywords naturally in the translation
     """)
