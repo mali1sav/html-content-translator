@@ -53,9 +53,31 @@ def extract_json_safely(resp_text):
         st.error(f"JSON extraction error: {str(e)}")
         return None
 
-def _translate_single(text: str, keyword: str = "", max_retries=3) -> dict:
+def _translate_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False) -> dict:
     """Translate a single chunk of HTML content using Claude via OpenRouter with retries."""
-    prompt = f"""You are a Senior Thai Crypto journalist specializing in translating technical crypto content. Translate HTML content to Thai by following these strict translation requirements:
+    secondary_keywords = secondary_keywords or []
+    
+    if simplified_mode:
+        # Use a simpler prompt with fewer requirements for problematic chunks
+        prompt = f"""You are a Thai translator specializing in HTML content. Translate this HTML chunk to Thai following these critical requirements:
+
+1. Never modify HTML tags or attributes - only translate visible text
+2. Keep all technical terms and brand names in English
+3. Preserve all URLs, variables, and code exactly as they are
+4. Return ONLY a valid JSON object with this exact structure:
+{{
+  "translated_html": "HTML content with Thai text",
+  "titles": ["Any title found"],
+  "meta_descriptions": ["Any meta description found"],
+  "alt_text": "Any alt text found",
+  "wordpress_slug": "english-version-of-title"
+}}
+
+Content to translate:
+{text}"""
+    else:
+        # Use the full detailed prompt for normal translation
+        prompt = f"""You are a Senior Thai Crypto journalist specializing in translating technical crypto content. Translate HTML content to Thai by following these strict translation requirements:
 
 1. Preserve HTML Structure
    Keep all HTML tags, attributes, and inline styles completely unchanged. Do not modify the HTML in any way except to translate the visible text.
@@ -87,9 +109,20 @@ def _translate_single(text: str, keyword: str = "", max_retries=3) -> dict:
 
 7. Do not add or remove wrapper tags (like <!DOCTYPE html>, <html>, <head>, or <body>) unless they already exist in the snippet.
 
-8. Keyword to Target: {keyword if keyword else "None provided"}
-   {f"Ensure that the keyword '{keyword}' appears at least 7 times where contextually appropriate in the translated text, without violating the above rules." if keyword else "No keyword targeting required."}
-   This means if there is a natural spot in the text where you can include the keyword in Thai (or as-is if it's a brand/technical term), do so. Do not force the keyword in places that break grammar or context.
+8. Keyword Integration:
+   Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
+   {f"Ensure that the primary keyword '{primary_keyword}' appears naturally in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x). Maintain original language (whether Thai or English or mix)." if primary_keyword else "No primary keyword provided."}
+   
+   Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
+   {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the translated content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
+   {f"   - At least 2-3 H2 or H3 headings" if secondary_keywords else ""}
+   {f"   - Within paragraphs where they fit naturally" if secondary_keywords else ""}
+   {f"   - In the FAQ section questions and answers (if present)" if secondary_keywords else ""}
+   
+   {f"Priority secondary keywords (include these first):" if secondary_keywords else ""}
+   {f"   {', '.join(secondary_keywords[:5]) if len(secondary_keywords) > 5 else ', '.join(secondary_keywords)}" if secondary_keywords else ""}
+   
+   {f"Limit each secondary keyword to maximum 2 mentions in the entire content." if secondary_keywords else ""}
 
 9. VERY IMPORTANT: This is chunk of a larger HTML document. Translate ONLY what's provided. Don't try to complete or start tags that seem incomplete - they will be joined with other chunks.
 
@@ -98,8 +131,21 @@ Return exactly a valid JSON object matching the following schema without any add
   "translated_html": "STRING",
   "titles": ["STRING"],
   "meta_descriptions": ["STRING"],
-  "alt_text": "STRING"
+  "alt_text": "STRING",
+  "wordpress_slug": "STRING"
 }}
+
+For meta_descriptions, create 3 distinct meta descriptions that:
+- Each contains the primary keyword once
+- Each contains 2-3 different secondary keywords
+- Are between 150-160 characters in length
+- Have different sentence structures and focuses
+
+The wordpress_slug should be an English-language URL-friendly version that:
+- Closely matches high-volume search terms in your market
+- Is concise (3-5 words maximum)
+- Includes the year (2025) and main topic (crypto/altcoin)
+- Focuses on the investment aspect (e.g., "best-crypto-investments-2025")
 
 Content to translate:
 {text}
@@ -169,6 +215,8 @@ Return ONLY the JSON object, with no extra text or commentary."""
             continue
 
         required = ['translated_html', 'titles', 'meta_descriptions', 'alt_text']
+        optional = ['wordpress_slug']
+        
         missing = [field for field in required if field not in result]
         if missing:
             st.error(f"Missing required fields: {missing} Attempt {attempt+1}/{max_retries}")
@@ -176,18 +224,27 @@ Return ONLY the JSON object, with no extra text or commentary."""
                 return None
             time.sleep(2)
             continue
+            
+        # Add wordpress_slug if missing
+        if 'wordpress_slug' not in result and result.get('titles') and result['titles']:
+            # Create a simple slug from the first title
+            from re import sub
+            title = result['titles'][0]
+            result['wordpress_slug'] = sub(r'[^\w\s-]', '', title.lower())
+            result['wordpress_slug'] = sub(r'[\s-]+', '-', result['wordpress_slug'])
 
         result['translated_html'] = html.unescape(result['translated_html'])
         return result
     return None
 
-def translate_chunk_with_fallback(chunk, keyword="", max_level=3):
+def translate_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=None, max_level=3):
     """
     Attempts to translate a chunk using _translate_single.
     If translation fails and max_level is not exceeded, the chunk is split into halves recursively.
     Returns a dictionary with combined translated_html and aggregated SEO elements or None if translation fails.
     """
-    result = _translate_single(chunk, keyword)
+    secondary_keywords = secondary_keywords or []
+    result = _translate_single(chunk, primary_keyword, secondary_keywords)
     if result is not None:
         return result
     else:
@@ -196,19 +253,21 @@ def translate_chunk_with_fallback(chunk, keyword="", max_level=3):
         mid = len(chunk) // 2
         chunk1 = chunk[:mid]
         chunk2 = chunk[mid:]
-        result1 = translate_chunk_with_fallback(chunk1, keyword, max_level-1)
-        result2 = translate_chunk_with_fallback(chunk2, keyword, max_level-1)
+        result1 = translate_chunk_with_fallback(chunk1, primary_keyword, secondary_keywords, max_level-1)
+        result2 = translate_chunk_with_fallback(chunk2, "", secondary_keywords, max_level-1)
         if result1 is None or result2 is None:
             return None
         combined_html = result1['translated_html'] + result2['translated_html']
         titles = result1['titles'] + result2['titles']
         meta_descriptions = result1['meta_descriptions'] + result2['meta_descriptions']
         alt_text = result1['alt_text'] if result1['alt_text'].strip() else result2['alt_text']
+        wordpress_slug = result1.get('wordpress_slug', '') if result1.get('wordpress_slug', '').strip() else result2.get('wordpress_slug', '')
         return {
             'translated_html': combined_html,
             'titles': titles,
             'meta_descriptions': meta_descriptions,
-            'alt_text': alt_text
+            'alt_text': alt_text,
+            'wordpress_slug': wordpress_slug
         }
 
 def smart_chunk_html(html_content: str, max_length: int) -> list:
@@ -294,13 +353,15 @@ def smart_chunk_html(html_content: str, max_length: int) -> list:
     
     return chunks
 
-def translate_content(content: str, keyword: str = "") -> dict:
+def translate_content(content: str, primary_keyword: str = "", secondary_keywords: list = None) -> dict:
     """
     Translate HTML content. If content is too long, split it into chunks,
     translate each using fallback logic, and combine results.
     """
+    secondary_keywords = secondary_keywords or []
     content_hash = hashlib.md5(content.encode()).hexdigest()
-    cache_key = f"translation_cache_{content_hash}_{keyword}"
+    keywords_hash = hashlib.md5(f"{primary_keyword}{''.join(secondary_keywords)}".encode()).hexdigest()
+    cache_key = f"translation_cache_{content_hash}_{keywords_hash}"
     cached_result = st.session_state.get(cache_key)
     if cached_result:
         st.success("Retrieved from cache!")
@@ -308,14 +369,14 @@ def translate_content(content: str, keyword: str = "") -> dict:
     
     total_length = len(content)
     if total_length < 10000:
-        CHUNK_LIMIT = 8000
+        CHUNK_LIMIT = 6000  # Reduced from 8000
     elif total_length < 50000:
-        CHUNK_LIMIT = 20000
+        CHUNK_LIMIT = 12000  # Reduced from 20000
     else:
-        CHUNK_LIMIT = 30000
+        CHUNK_LIMIT = 10000  # Significantly reduced from 30000
     
     if total_length <= CHUNK_LIMIT:
-        result = translate_chunk_with_fallback(content, keyword)
+        result = translate_chunk_with_fallback(content, primary_keyword, secondary_keywords)
         if result:
             st.session_state[cache_key] = result
         return result
@@ -329,19 +390,23 @@ def translate_content(content: str, keyword: str = "") -> dict:
         seo_elements = {
             'titles': [],
             'meta_descriptions': [],
-            'alt_text': ""
+            'alt_text': "",
+            'wordpress_slug': ""
         }
-        keyword_inserted = False
+        primary_keyword_inserted = False
         failed_chunks = []
         for i, chunk in enumerate(chunks):
             progress = i / actual_chunks
             progress_bar.progress(progress)
             status_text.text(f"Translating chunk {i+1}/{actual_chunks}...")
-            chunk_keyword = ""
-            if keyword and not keyword_inserted:
-                chunk_keyword = keyword
-                keyword_inserted = True
-            result = translate_chunk_with_fallback(chunk, chunk_keyword)
+            
+            # For the first chunk, include primary keyword. For others, just secondary keywords
+            chunk_primary = ""
+            if primary_keyword and not primary_keyword_inserted and i == 0:
+                chunk_primary = primary_keyword
+                primary_keyword_inserted = True
+            
+            result = translate_chunk_with_fallback(chunk, chunk_primary, secondary_keywords)
             if result is None:
                 failed_chunks.append(i)
                 continue
@@ -353,12 +418,68 @@ def translate_content(content: str, keyword: str = "") -> dict:
             if result['alt_text'] and result['alt_text'].strip():
                 if not seo_elements['alt_text']:
                     seo_elements['alt_text'] = result['alt_text']
+            if result.get('wordpress_slug', '') and result.get('wordpress_slug', '').strip():
+                if not seo_elements['wordpress_slug']:
+                    seo_elements['wordpress_slug'] = result.get('wordpress_slug', '')
             time.sleep(1)
         progress_bar.progress(1.0)
+        # Add retry logic for failed chunks with simplified parameters
         if failed_chunks:
-            status_text.text(f"Warning: {len(failed_chunks)}/{actual_chunks} chunks failed to translate.")
-            if not translated_chunks:
-                return None
+            status_text.text(f"Attempting to retry {len(failed_chunks)} failed chunks with simplified parameters...")
+            retried_chunks = []
+            for chunk_idx in failed_chunks:
+                # Try again with no keywords and simplified mode for problematic chunks
+                retry_result = _translate_single(chunks[chunk_idx], "", [], max_retries=2, simplified_mode=True)
+                if retry_result is not None:
+                    # Insert at the correct position to maintain order
+                    translated_chunks.insert(chunk_idx, retry_result['translated_html'])
+                    retried_chunks.append(chunk_idx)
+                    # Update progress
+                    progress = (i + 1 + len(retried_chunks)) / actual_chunks
+                    progress_bar.progress(progress)
+                    status_text.text(f"Recovered chunk {chunk_idx+1}")
+                    time.sleep(1)
+            
+            # Update failed chunks list
+            remaining_failed = [idx for idx in failed_chunks if idx not in retried_chunks]
+            
+            # Final desperate attempt for any remaining failed chunks - split them into tiny chunks
+            if remaining_failed:
+                status_text.text(f"Final attempt for {len(remaining_failed)} still-failing chunks using micro-chunking...")
+                still_failed = []
+                for chunk_idx in remaining_failed:
+                    # Break into much smaller pieces
+                    micro_chunk_size = min(3000, len(chunks[chunk_idx]) // 2)
+                    micro_chunks = []
+                    for i in range(0, len(chunks[chunk_idx]), micro_chunk_size):
+                        micro_chunks.append(chunks[chunk_idx][i:i+micro_chunk_size])
+                    
+                    micro_translated = []
+                    all_micro_successful = True
+                    for micro_idx, micro_chunk in enumerate(micro_chunks):
+                        micro_result = _translate_single(micro_chunk, "", [], max_retries=1, simplified_mode=True)
+                        if micro_result is None:
+                            all_micro_successful = False
+                            break
+                        micro_translated.append(micro_result['translated_html'])
+                    
+                    if all_micro_successful:
+                        # All micro-chunks translated successfully
+                        translated_chunks.insert(chunk_idx, "".join(micro_translated))
+                        status_text.text(f"Recovered chunk {chunk_idx+1} using micro-chunking")
+                    else:
+                        still_failed.append(chunk_idx)
+                
+                # Final update on any chunks that still failed
+                if still_failed:
+                    status_text.text(f"Warning: {len(still_failed)}/{actual_chunks} chunks failed all translation attempts.")
+                    st.error(f"Failed chunk indices: {still_failed}. Translation may be incomplete.")
+                    if not translated_chunks:
+                        return None
+                else:
+                    status_text.text("All chunks successfully translated after multiple retry strategies!")
+            else:
+                status_text.text("All chunks successfully translated after retry!")
         else:
             status_text.text("Translation complete!")
         combined_html = "".join(translated_chunks)
@@ -366,7 +487,8 @@ def translate_content(content: str, keyword: str = "") -> dict:
             'translated_html': combined_html,
             'titles': seo_elements['titles'],
             'meta_descriptions': seo_elements['meta_descriptions'],
-            'alt_text': seo_elements['alt_text']
+            'alt_text': seo_elements['alt_text'],
+            'wordpress_slug': seo_elements['wordpress_slug']
         }
         st.session_state[cache_key] = final_result
         return final_result
@@ -387,20 +509,6 @@ except Exception as e:
 st.title("Crypto HTML Translation")
 st.subheader("Thai Crypto Journalist Translation Tool")
 
-with st.expander("Translation Guidelines", expanded=False):
-    st.markdown("""
-    **This tool follows these translation guidelines:**
-    
-    1. **Preserves HTML structure** - All tags and attributes remain intact
-    2. **Retains technical content** - URLs, placeholders, and code are preserved
-    3. **Maintains English technical terms** - Crypto terminology stays in English
-    4. **Translates all visible text** - Including spans and anchor text
-    5. **Modifies specific links** - Changes select domains to Thai versions
-    6. **Ensures proper Thai spacing and punctuation** .
-    7. **Preserves document structure** - No wrapper tags added or removed
-    8. **Keyword targeting** - Includes specified keywords naturally in the translation
-    """)
-
 upload_method = st.radio("Choose input method:", ["Text Input", "File Upload"])
 html_input = ""
 if upload_method == "Text Input":
@@ -413,7 +521,23 @@ else:
         with st.expander("Preview uploaded content"):
             st.code(html_input[:500] + "..." if len(html_input) > 500 else html_input, language="html")
 
-keyword_input = st.text_input("Target keyword (optional):", placeholder="e.g., web3 wallet")
+# Multi-keyword input (one per line)
+keyword_input = st.text_area(
+    "Keywords (one per line, first keyword is primary):",
+    placeholder="Primary keyword\nSecondary keyword 1\nSecondary keyword 2",
+    height=100
+)
+
+# Parse keywords
+keywords = [k.strip() for k in keyword_input.split('\n') if k.strip()]
+primary_keyword = keywords[0] if keywords else ""
+secondary_keywords = keywords[1:] if len(keywords) > 1 else []
+
+# Display parsed keywords for clarity
+if keywords:
+    st.info(f"Primary keyword: {primary_keyword}")
+    if secondary_keywords:
+        st.info(f"Secondary keywords: {', '.join(secondary_keywords)}")
 
 with st.expander("Advanced Options"):
     st.info("These settings help optimize translation of very large documents.")
@@ -439,7 +563,7 @@ if st.button("Translate"):
         start_time = time.time()
         with st.spinner("Analyzing document..."):
             try:
-                result = translate_content(html_input, keyword_input)
+                result = translate_content(html_input, primary_keyword, secondary_keywords)
             except Exception as e:
                 st.error(f"Translation failed: {str(e)}")
                 result = None
@@ -454,7 +578,7 @@ if st.button("Translate"):
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'input_length': len(html_input),
                     'output_length': len(result['translated_html']),
-                    'keyword': keyword_input if keyword_input else "None",
+                    'keyword': primary_keyword if primary_keyword else "None",
                     'process_time': process_time
                 }
                 st.session_state['history'].append(history_entry)
@@ -479,14 +603,37 @@ if st.button("Translate"):
                 with st.expander("Translated HTML Content", expanded=True):
                     st.code(result['translated_html'], language='html')
                 
-                with st.expander("SEO Elements"):
+                with st.expander("SEO Elements", expanded=True):
                     st.write("Titles:", result['titles'])
                     st.write("Meta Descriptions:", result['meta_descriptions'])
                     st.write("Alt Text:", result['alt_text'])
+                    st.write("WordPress Slug:", result.get('wordpress_slug', ''))
                 
-                if keyword_input:
-                    keyword_count = result['translated_html'].lower().count(keyword_input.lower())
-                    st.info(f"Keyword '{keyword_input}' appears {keyword_count} times in the translated content.")
+                # Keyword usage analysis
+                if primary_keyword:
+                    primary_count = result['translated_html'].lower().count(primary_keyword.lower())
+                    if primary_count == 0:
+                        st.warning(f"⚠️ Primary keyword '{primary_keyword}' is missing from the translation!")
+                    else:
+                        st.info(f"✅ Primary keyword '{primary_keyword}' appears {primary_count} times in the translated content.")
+                
+                # Check for missing secondary keywords
+                missing_keywords = []
+                for sec_keyword in secondary_keywords:
+                    sec_count = result['translated_html'].lower().count(sec_keyword.lower())
+                    if sec_count == 0:
+                        missing_keywords.append(sec_keyword)
+                        st.warning(f"⚠️ Secondary keyword '{sec_keyword}' is missing from the translation!")
+                    else:
+                        st.info(f"✅ Secondary keyword '{sec_keyword}' appears {sec_count} times in the translated content.")
+                
+                # Summary of keyword coverage
+                if secondary_keywords:
+                    coverage = ((len(secondary_keywords) - len(missing_keywords)) / len(secondary_keywords)) * 100
+                    if coverage == 100:
+                        st.success(f"🎯 All keywords successfully integrated in the translation!")
+                    else:
+                        st.info(f"Keyword coverage: {coverage:.1f}% ({len(secondary_keywords) - len(missing_keywords)}/{len(secondary_keywords)} keywords)")
 
 with st.sidebar.expander("Translation History"):
     if not st.session_state['history']:
