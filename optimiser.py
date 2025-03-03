@@ -85,8 +85,7 @@ Content to optimize:
 2. Retain Technical Content
    Do not modify any technical elements such as URLs, placeholders (e.g., [cur_year], {{{{variable}}}}), and shortcodes (e.g., [su_note], [toc]). They must remain exactly as they are.
 
-3. Maintain Entity Names, Brands, and Technical Terms
-   Do not change entity names or brands. For example, always use "Bitcoin" and keep all other technical terms in their original form.
+3. Keep Entity Names (people, places, organisation), Brands, coin names, and Technical Terms in English.
 
 4. Optimize Content Without Changing Meaning
    You must maintain the meaning and intent of the original Thai content. Your goal is to optimize the text for keywords while keeping the original meaning intact. Do not add new information that wasn't in the original content.
@@ -96,7 +95,7 @@ Content to optimize:
 
 6. Keyword Integration:
    Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
-   {f"Ensure that the primary keyword '{primary_keyword}' appears naturally in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x)." if primary_keyword else "No primary keyword provided."}
+   {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally in sentence structure in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x)." if primary_keyword else "No primary keyword provided."}
    
    Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
    {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the optimized content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
