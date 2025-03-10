@@ -237,38 +237,240 @@ Return ONLY the JSON object, with no extra text or commentary."""
         return result
     return None
 
+def is_wordpress_gutenberg_content(content: str) -> bool:
+    """
+    Detect if the content contains WordPress Gutenberg blocks.
+    """
+    return bool(re.search(r'<!-- wp:', content))
+
+def find_gutenberg_block_boundaries(content: str) -> list:
+    """
+    Find the start and end positions of WordPress Gutenberg blocks.
+    Returns a list of tuples (start_pos, end_pos) for each block.
+    """
+    block_boundaries = []
+    
+    # Find all block markers (opening and closing)
+    opening_pattern = re.compile(r'<!-- wp:[^\s>]+ .*?-->')
+    closing_pattern = re.compile(r'<!-- /wp:[^\s>]+ -->')
+    
+    # Find all opening markers
+    opening_matches = list(opening_pattern.finditer(content))
+    
+    # Find all closing markers
+    closing_matches = list(closing_pattern.finditer(content))
+    
+    # Match opening and closing blocks
+    for opening_match in opening_matches:
+        opening_pos = opening_match.start()
+        opening_text = opening_match.group(0)
+        
+        # Extract block name from opening marker
+        opening_name_match = re.search(r'<!-- wp:([^\s>]+)', opening_text)
+        if not opening_name_match:
+            continue
+            
+        opening_name = opening_name_match.group(1)
+        
+        # Find corresponding closing marker
+        for closing_match in closing_matches:
+            closing_pos = closing_match.end()
+            closing_text = closing_match.group(0)
+            
+            # Extract block name from closing marker
+            closing_name_match = re.search(r'<!-- /wp:([^\s>]+)', closing_text)
+            if not closing_name_match:
+                continue
+                
+            closing_name = closing_name_match.group(1)
+            
+            # Check if names match and closing comes after opening
+            if opening_name == closing_name and closing_pos > opening_pos:
+                # Check if this is the closest matching closing tag
+                block_content = content[opening_pos:closing_pos]
+                # Count opening and closing tags of the same type within this range
+                opening_count = len(re.findall(f'<!-- wp:{opening_name}[\\s>]', block_content))
+                closing_count = len(re.findall(f'<!-- /wp:{opening_name} -->', block_content))
+                
+                # If counts match, we found the correct closing tag
+                if opening_count == closing_count:
+                    block_boundaries.append((opening_pos, closing_pos))
+                    break
+    
+    return block_boundaries
+
+def smart_chunk_wordpress_content(content: str, max_length: int) -> list:
+    """
+    Specialized chunking for WordPress Gutenberg content that preserves block integrity.
+    """
+    # If content doesn't contain WordPress blocks, use regular chunking
+    if not is_wordpress_gutenberg_content(content):
+        if not BeautifulSoup:
+            return [content[i:i+max_length] for i in range(0, len(content), max_length)]
+        else:
+            return smart_chunk_html(content, max_length)
+    
+    # Find all Gutenberg block boundaries
+    block_boundaries = find_gutenberg_block_boundaries(content)
+    
+    if not block_boundaries:
+        # Fallback to regular chunking if no Gutenberg blocks found
+        if not BeautifulSoup:
+            return [content[i:i+max_length] for i in range(0, len(content), max_length)]
+        else:
+            return smart_chunk_html(content, max_length)
+    
+    # Sort blocks by start position
+    block_boundaries.sort(key=lambda x: x[0])
+    
+    chunks = []
+    current_chunk = StringIO()
+    current_size = 0
+    last_end = 0
+    
+    # Process content by respecting block boundaries
+    for start, end in block_boundaries:
+        # Add content between last block and current block
+        if start > last_end:
+            between_content = content[last_end:start]
+            between_len = len(between_content)
+            
+            # If adding between content would exceed max_length, start a new chunk
+            if current_size + between_len > max_length and current_size > 0:
+                chunks.append(current_chunk.getvalue())
+                current_chunk = StringIO()
+                current_size = 0
+            
+            current_chunk.write(between_content)
+            current_size += between_len
+        
+        # Process the current block
+        block_content = content[start:end]
+        block_len = len(block_content)
+        
+        # If the block itself exceeds max_length, we need to handle it specially
+        if block_len > max_length:
+            # If we have content in the current chunk, add it first
+            if current_size > 0:
+                chunks.append(current_chunk.getvalue())
+                current_chunk = StringIO()
+                current_size = 0
+            
+            # For large blocks, we keep them intact but as separate chunks
+            chunks.append(block_content)
+        else:
+            # If adding this block would exceed max_length, start a new chunk
+            if current_size + block_len > max_length and current_size > 0:
+                chunks.append(current_chunk.getvalue())
+                current_chunk = StringIO()
+                current_size = 0
+            
+            current_chunk.write(block_content)
+            current_size += block_len
+        
+        last_end = end
+    
+    # Add any remaining content after the last block
+    if last_end < len(content):
+        remaining = content[last_end:]
+        remaining_len = len(remaining)
+        
+        if current_size + remaining_len > max_length and current_size > 0:
+            chunks.append(current_chunk.getvalue())
+            current_chunk = StringIO()
+            current_chunk.write(remaining)
+        else:
+            current_chunk.write(remaining)
+    
+    # Add the final chunk if there's anything left
+    if current_chunk.getvalue():
+        chunks.append(current_chunk.getvalue())
+    
+    return chunks
+
 def translate_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=None, max_level=3):
     """
     Attempts to translate a chunk using _translate_single.
-    If translation fails and max_level is not exceeded, the chunk is split into halves recursively.
+    If translation fails and max_level is not exceeded, the chunk is split intelligently.
     Returns a dictionary with combined translated_html and aggregated SEO elements or None if translation fails.
     """
     secondary_keywords = secondary_keywords or []
+    
+    # First attempt: try to translate the whole chunk
     result = _translate_single(chunk, primary_keyword, secondary_keywords)
     if result is not None:
         return result
+    
+    # If we've reached the maximum recursion level or the chunk is too small, give up
+    if max_level <= 0 or len(chunk) < 1000:
+        return None
+    
+    # Check if this is WordPress Gutenberg content
+    is_wp_content = is_wordpress_gutenberg_content(chunk)
+    
+    # For WordPress content, try to split at block boundaries
+    if is_wp_content:
+        block_boundaries = find_gutenberg_block_boundaries(chunk)
+        if block_boundaries:
+            # If we have multiple blocks, try to split between them
+            if len(block_boundaries) > 1:
+                # Find a good splitting point (middle block boundary)
+                mid_idx = len(block_boundaries) // 2
+                split_point = block_boundaries[mid_idx][0]
+                
+                chunk1 = chunk[:split_point]
+                chunk2 = chunk[split_point:]
+            else:
+                # Only one block, split before and after it
+                start, end = block_boundaries[0]
+                if start > 0:
+                    # Content before the block
+                    chunk1 = chunk[:start]
+                    # Block and content after it
+                    chunk2 = chunk[start:]
+                elif end < len(chunk):
+                    # Block
+                    chunk1 = chunk[:end]
+                    # Content after the block
+                    chunk2 = chunk[end:]
+                else:
+                    # Just split in the middle as a last resort
+                    mid = len(chunk) // 2
+                    chunk1 = chunk[:mid]
+                    chunk2 = chunk[mid:]
+        else:
+            # No block boundaries found, split in the middle
+            mid = len(chunk) // 2
+            chunk1 = chunk[:mid]
+            chunk2 = chunk[mid:]
     else:
-        if max_level <= 0 or len(chunk) < 1000:
-            return None
+        # For regular HTML, split in the middle
         mid = len(chunk) // 2
         chunk1 = chunk[:mid]
         chunk2 = chunk[mid:]
-        result1 = translate_chunk_with_fallback(chunk1, primary_keyword, secondary_keywords, max_level-1)
-        result2 = translate_chunk_with_fallback(chunk2, "", secondary_keywords, max_level-1)
-        if result1 is None or result2 is None:
-            return None
-        combined_html = result1['translated_html'] + result2['translated_html']
-        titles = result1['titles'] + result2['titles']
-        meta_descriptions = result1['meta_descriptions'] + result2['meta_descriptions']
-        alt_text = result1['alt_text'] if result1['alt_text'].strip() else result2['alt_text']
-        wordpress_slug = result1.get('wordpress_slug', '') if result1.get('wordpress_slug', '').strip() else result2.get('wordpress_slug', '')
-        return {
-            'translated_html': combined_html,
-            'titles': titles,
-            'meta_descriptions': meta_descriptions,
-            'alt_text': alt_text,
-            'wordpress_slug': wordpress_slug
-        }
+    
+    # Try to translate each half recursively
+    result1 = translate_chunk_with_fallback(chunk1, primary_keyword, secondary_keywords, max_level-1)
+    result2 = translate_chunk_with_fallback(chunk2, "", secondary_keywords, max_level-1)
+    
+    # If either half failed, the whole chunk fails
+    if result1 is None or result2 is None:
+        return None
+    
+    # Combine the results
+    combined_html = result1['translated_html'] + result2['translated_html']
+    titles = result1['titles'] + result2['titles']
+    meta_descriptions = result1['meta_descriptions'] + result2['meta_descriptions']
+    alt_text = result1['alt_text'] if result1['alt_text'].strip() else result2['alt_text']
+    wordpress_slug = result1.get('wordpress_slug', '') if result1.get('wordpress_slug', '').strip() else result2.get('wordpress_slug', '')
+    
+    return {
+        'translated_html': combined_html,
+        'titles': titles,
+        'meta_descriptions': meta_descriptions,
+        'alt_text': alt_text,
+        'wordpress_slug': wordpress_slug
+    }
 
 def smart_chunk_html(html_content: str, max_length: int) -> list:
     """
@@ -276,6 +478,10 @@ def smart_chunk_html(html_content: str, max_length: int) -> list:
     Tries to split at major section boundaries when possible.
     Uses BeautifulSoup if available for better parsing.
     """
+    # Check if content contains WordPress Gutenberg blocks
+    if is_wordpress_gutenberg_content(html_content):
+        return smart_chunk_wordpress_content(html_content, max_length)
+    
     if not BeautifulSoup:
         return [html_content[i:i+max_length] for i in range(0, len(html_content), max_length)]
     
@@ -367,13 +573,27 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         st.success("Retrieved from cache!")
         return cached_result
     
+    # Detect if content is WordPress Gutenberg
+    is_wp_content = is_wordpress_gutenberg_content(content)
+    
+    # Adjust chunk limits based on content type and length
     total_length = len(content)
-    if total_length < 10000:
-        CHUNK_LIMIT = 6000  # Reduced from 8000
-    elif total_length < 50000:
-        CHUNK_LIMIT = 12000  # Reduced from 20000
+    if is_wp_content:
+        # Use larger chunks for WordPress content to keep blocks together
+        if total_length < 10000:
+            CHUNK_LIMIT = 5000  # Smaller chunks for WP content
+        elif total_length < 50000:
+            CHUNK_LIMIT = 8000  # Reduced from 12000
+        else:
+            CHUNK_LIMIT = 8000  # Reduced from 10000
     else:
-        CHUNK_LIMIT = 10000  # Significantly reduced from 30000
+        # Regular HTML content
+        if total_length < 10000:
+            CHUNK_LIMIT = 6000
+        elif total_length < 50000:
+            CHUNK_LIMIT = 12000
+        else:
+            CHUNK_LIMIT = 10000
     
     if total_length <= CHUNK_LIMIT:
         result = translate_chunk_with_fallback(content, primary_keyword, secondary_keywords)
@@ -381,7 +601,11 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
             st.session_state[cache_key] = result
         return result
     else:
-        chunks = smart_chunk_html(content, CHUNK_LIMIT)
+        # Use the appropriate chunking method based on content type
+        if is_wp_content:
+            chunks = smart_chunk_wordpress_content(content, CHUNK_LIMIT)
+        else:
+            chunks = smart_chunk_html(content, CHUNK_LIMIT)
         actual_chunks = len(chunks)
         progress_bar = st.progress(0)
         status_text = st.empty()
