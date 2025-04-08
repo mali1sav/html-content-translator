@@ -25,9 +25,12 @@ def init_openrouter_client():
     if not api_key:
         raise ValueError("OpenRouter API key not found")
     
+    # Get model from environment variable or use default
+    model = os.getenv('OPENROUTER_MODEL', "anthropic/claude-3.7-sonnet")
+    
     return {
         'api_key': api_key,
-        'default_model': "anthropic/claude-3.7-sonnet:beta",
+        'default_model': model,
         'api_url': "https://openrouter.ai/api/v1/chat/completions"
     }
 
@@ -36,22 +39,134 @@ def extract_json_safely(resp_text):
     Attempts to extract a JSON object from the response text.
     Returns the parsed JSON object or None if extraction fails.
     """
+    # Debug log the response (first 500 chars to avoid excessive length)
+    debug_text = resp_text[:500] + '...' if len(resp_text) > 500 else resp_text
+    st.session_state['debug_log'] = debug_text
+    
+    # Method 1: Try direct JSON loading first
     try:
-        json_match = re.search(r'\{.*\}', resp_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(0)
-        else:
-            start_index = resp_text.find('{')
-            end_index = resp_text.rfind('}')
-            if start_index != -1 and end_index != -1 and end_index > start_index:
-                json_str = resp_text[start_index:end_index + 1]
-            else:
-                return None
-        clean_json_str = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', json_str)
-        return json.loads(clean_json_str, strict=False)
+        # First, try to load the entire response as JSON
+        parsed = json.loads(resp_text, strict=False)
+        if isinstance(parsed, dict) and 'translated_html' in parsed:
+            return parsed
+    except json.JSONDecodeError:
+        # Continue with extraction methods if direct loading fails
+        pass
+    
+    # Method 2: Try to extract JSON manually by getting content between first { and last }
+    try:
+        # Find the first opening brace
+        start_index = resp_text.find('{')
+        if start_index == -1:
+            raise ValueError("No opening brace found")
+
+        # Find the matching closing brace, accounting for nested structures
+        brace_level = 0
+        end_index = -1
+        in_string = False
+        escape_char = False
+        
+        for i, char in enumerate(resp_text[start_index:]):
+            current_index = start_index + i
+            
+            if char == '"' and not escape_char:
+                in_string = not in_string
+            
+            if not in_string:
+                if char == '{':
+                    brace_level += 1
+                elif char == '}':
+                    brace_level -= 1
+                    if brace_level == 0:
+                        end_index = current_index
+                        break # Found the matching closing brace
+            
+            # Handle escape characters
+            escape_char = char == '\\' and not escape_char
+
+        if end_index == -1:
+            raise ValueError("Matching closing brace not found")
+
+        # Extract the potential JSON string
+        json_str = resp_text[start_index:end_index+1]
+
+        # Clean control characters
+        json_str = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', json_str)
+
+        try:
+            # Try parsing the extracted JSON
+            parsed = json.loads(json_str, strict=False)
+            if isinstance(parsed, dict) and 'translated_html' in parsed:
+                return parsed
+        except json.JSONDecodeError as e:
+            st.warning(f"Method 2 JSON parse error: {e}. Preview: {json_str[:200]}...")
+
     except Exception as e:
-        st.error(f"JSON extraction error: {str(e)}")
-        return None
+        st.warning(f"Method 2 error: {str(e)}")
+    
+    # Method 3: Manual JSON construction from the response text
+    try:
+        # Look for the translated_html key specifically since that's what we need
+        translated_html_match = re.search(r'"translated_html"\s*:\s*"(.*?)(?<!\\)"', resp_text, re.DOTALL)
+        titles_match = re.search(r'"titles"\s*:\s*\[(.*?)\]', resp_text, re.DOTALL)
+        meta_desc_match = re.search(r'"meta_descriptions"\s*:\s*\[(.*?)\]', resp_text, re.DOTALL)
+        alt_text_match = re.search(r'"alt_text"\s*:\s*"(.*?)(?<!\\)"', resp_text, re.DOTALL)
+        wp_slug_match = re.search(r'"wordpress_slug"\s*:\s*"(.*?)(?<!\\)"', resp_text, re.DOTALL)
+        
+        # If we have at least the translated_html key, we can create a valid response
+        if translated_html_match:
+            result = {}
+            result['translated_html'] = html.unescape(translated_html_match.group(1))
+            
+            # Extract titles, handling potential HTML and quotes
+            if titles_match:
+                title_items = []
+                # Extract individual title items from array
+                title_items_match = re.finditer(r'"(.*?)(?<!\\)"', titles_match.group(1))
+                for m in title_items_match:
+                    title_items.append(html.unescape(m.group(1)))
+                result['titles'] = title_items
+            else:
+                result['titles'] = []
+            
+            # Extract meta descriptions
+            if meta_desc_match:
+                meta_items = []
+                # Extract individual meta items from array
+                meta_items_match = re.finditer(r'"(.*?)(?<!\\)"', meta_desc_match.group(1))
+                for m in meta_items_match:
+                    meta_items.append(html.unescape(m.group(1)))
+                result['meta_descriptions'] = meta_items
+            else:
+                result['meta_descriptions'] = []
+            
+            # Extract alt text if present
+            if alt_text_match:
+                result['alt_text'] = html.unescape(alt_text_match.group(1))
+            else:
+                result['alt_text'] = ""
+            
+            # Extract WordPress slug if present
+            if wp_slug_match:
+                result['wordpress_slug'] = wp_slug_match.group(1)
+            else:
+                # Create a default slug if none is found
+                if result.get('titles') and result['titles']:
+                    from re import sub
+                    title = result['titles'][0]
+                    slug = sub(r'[^\w\s-]', '', title.lower())
+                    slug = sub(r'[\s-]+', '-', slug)
+                    result['wordpress_slug'] = slug
+                else:
+                    result['wordpress_slug'] = "default-slug"
+            
+            return result
+    except Exception as e:
+        st.warning(f"Method 3 error: {str(e)}")
+    
+    # If all methods fail, log the response for debugging and return None
+    st.error(f"All extraction methods failed. First 300 chars of response: {resp_text[:300]}")
+    return None
 
 def _translate_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False) -> dict:
     """Translate a single chunk of HTML content using Claude via OpenRouter with retries."""
@@ -155,7 +270,9 @@ Return ONLY the JSON object, with no extra text or commentary."""
     client_config = init_openrouter_client()
     
     for attempt in range(max_retries):
+        st.info(f"Chunk processing attempt {attempt + 1}/{max_retries}...") # Log attempt start
         try:
+            st.info(f"Making API request (Timeout: {240}s)...") # Log before request
             response = requests.post(
                 url=client_config['api_url'],
                 headers={
@@ -174,6 +291,7 @@ Return ONLY the JSON object, with no extra text or commentary."""
                 timeout=240
             )
             
+            st.info(f"API request completed with status: {response.status_code}") # Log after request
             response.raise_for_status()
             resp_data = response.json()
             
@@ -191,39 +309,59 @@ Return ONLY the JSON object, with no extra text or commentary."""
                 continue
                 
             resp_text = resp_data['choices'][0]['message']['content']
+            st.info("Received API response content.") # Log response received
             
+        except requests.exceptions.HTTPError as http_err:
+            st.error(f"HTTP Error: {http_err} - Attempt {attempt + 1}/{max_retries}")
+            # Log the response content if available, as it might contain useful error details
+            try:
+                error_details = response.json()
+                st.error(f"API Error Details: {error_details}")
+            except json.JSONDecodeError:
+                st.error(f"API Response Content (non-JSON): {response.text[:500]}") # Log first 500 chars
+            
+            st.warning(f"Retrying after HTTP error (attempt {attempt + 1})...") # Log before retry
+            if attempt == max_retries - 1:
+                st.error("Max retries reached after HTTP error.")
+                return None
         except requests.exceptions.RequestException as e:
             st.error(f"API Request failed: {str(e)} - Attempt {attempt + 1}/{max_retries}")
+            
+            st.warning(f"Retrying after request exception (attempt {attempt + 1})...") # Log before retry
             if attempt == max_retries - 1:
+                st.error("Max retries reached after request exception.")
                 return None
-            time.sleep(2)
-            continue
 
         if not resp_text:
-            st.error(f"Empty response from Claude. Attempt {attempt+1}/{max_retries}")
+            st.error(f"Empty response from API. Attempt {attempt+1}/{max_retries}")
+            
+            st.warning(f"Retrying after empty response (attempt {attempt + 1})...") # Log before retry
             if attempt == max_retries - 1:
+                st.error("Max retries reached after empty response.")
                 return None
-            time.sleep(2)
-            continue
 
+        st.info("Attempting to extract JSON...") # Log before extraction
         result = extract_json_safely(resp_text)
         if result is None:
-            st.error(f"Failed to extract JSON on attempt {attempt+1}/{max_retries}. Preview: {resp_text[:300]}")
+            st.error(f"Failed to extract JSON on attempt {attempt+1}/{max_retries}. Preview: {st.session_state.get('debug_log', 'N/A')}")
+            
+            st.warning(f"Retrying after JSON extraction failure (attempt {attempt + 1})...") # Log before retry
             if attempt == max_retries - 1:
+                st.error("Max retries reached after JSON extraction failure.")
                 return None
-            time.sleep(2)
-            continue
 
+        st.info("Checking for missing fields...") # Log before field check
         required = ['translated_html', 'titles', 'meta_descriptions', 'alt_text']
         optional = ['wordpress_slug']
         
         missing = [field for field in required if field not in result]
         if missing:
             st.error(f"Missing required fields: {missing} Attempt {attempt+1}/{max_retries}")
+            
+            st.warning(f"Retrying after missing fields (attempt {attempt + 1})...") # Log before retry
             if attempt == max_retries - 1:
+                st.error("Max retries reached after missing fields.")
                 return None
-            time.sleep(2)
-            continue
             
         # Add wordpress_slug if missing
         if 'wordpress_slug' not in result and result.get('titles') and result['titles']:
@@ -234,7 +372,10 @@ Return ONLY the JSON object, with no extra text or commentary."""
             result['wordpress_slug'] = sub(r'[\s-]+', '-', result['wordpress_slug'])
 
         result['translated_html'] = html.unescape(result['translated_html'])
+        st.success(f"Chunk processing successful on attempt {attempt + 1}.") # Log success
         return result
+        
+    st.error("Chunk processing failed after all retries.") # Log overall failure
     return None
 
 def is_wordpress_gutenberg_content(content: str) -> bool:
@@ -363,10 +504,11 @@ def smart_chunk_wordpress_content(content: str, max_length: int) -> list:
             if current_size + block_len > max_length and current_size > 0:
                 chunks.append(current_chunk.getvalue())
                 current_chunk = StringIO()
-                current_size = 0
-            
-            current_chunk.write(block_content)
-            current_size += block_len
+                current_chunk.write(block_content)
+                current_size = block_len
+            else:
+                current_chunk.write(block_content)
+                current_size += block_len
         
         last_end = end
     
@@ -717,9 +859,12 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         st.session_state[cache_key] = final_result
         return final_result
 
-# Initialize translation history cache
+# Initialize translation history cache and debug log
 if 'history' not in st.session_state:
     st.session_state['history'] = []
+    
+if 'debug_log' not in st.session_state:
+    st.session_state['debug_log'] = ""
 
 # Initialize OpenRouter client
 try:
