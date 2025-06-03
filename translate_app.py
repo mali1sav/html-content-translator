@@ -26,12 +26,12 @@ def init_openrouter_client():
         raise ValueError("OpenRouter API key not found")
     
     # Get model from environment variable or use default
-    model = os.getenv('OPENROUTER_MODEL', "google/gemini-2.5-flash-preview-05-20")
+    model = os.getenv('OPENROUTER_MODEL', "anthropic/claude-sonnet-4")
     
     return {
         'api_key': api_key,
         'default_model': model,
-        'api_url': "https://openrouter.ai/api/v1/"
+        'api_url': "https://openrouter.ai/api/v1/chat/completions"
     }
 
 def extract_json_safely(resp_text):
