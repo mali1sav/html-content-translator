@@ -27,7 +27,7 @@ def init_openrouter_client():
     
     return {
         'api_key': api_key,
-        'default_model': "anthropic/claude-3.7-sonnet:beta",
+        'default_model': "anthropic/claude-sonnet-4",
         'api_url': "https://openrouter.ai/api/v1/chat/completions"
     }
 
@@ -95,7 +95,7 @@ Content to optimize:
 
 6. Keyword Integration:
    Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
-   {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally in sentence structure in Title (1x), First paragraph (1x), and Headings, and in almost every paragraph or bullet point where they fit naturally, Meta description (1x), and closing paragraph. The minimum primary keyword in the main body of the content should appear at least 25 times" if primary_keyword else "No primary keyword provided."}
+   {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally in sentence structure in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x)." if primary_keyword else "No primary keyword provided."}
    
    Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
    {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the optimized content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
