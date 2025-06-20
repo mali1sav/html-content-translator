@@ -94,9 +94,9 @@ Content to optimize:
    Optimize the content while strictly following Thai orthographic and typographic conventions. Make sure no extra spaces or punctuation errors are introduced.
 
 6. Keyword Integration:
-   Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
-   {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally in sentence structure in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x)." if primary_keyword else "No primary keyword provided."}
-   
+    Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
+    {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally throughout the ENTIRE content in the following way:\n    - Title (1x)\n    - First paragraph (1x)\n    - Every major section of content (at least once per section)\n    - In at least 2-3 H2 or H3 headings\n    - Meta description (1x)\n    IMPORTANT: DO NOT concentrate keyword usage only at the beginning and end - distribute evenly throughout all sections." if primary_keyword else "No primary keyword provided."}
+    
    Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
    {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the optimized content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
    {f"   - At least 2-3 H2 or H3 headings" if secondary_keywords else ""}
