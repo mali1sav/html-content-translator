@@ -76,7 +76,40 @@ def _optimize_single(text: str, primary_keyword: str = "", secondary_keywords: l
 Content to optimize:
 {text}"""
     else:
-        # Use the full detailed prompt for normal optimization
+        # Create the primary keyword instruction separately to avoid nested f-strings
+        if primary_keyword:
+            primary_keyword_instruction = f"""Ensure that the primary keyword '{primary_keyword}' is integrated naturally throughout the ENTIRE content in the following way:
+    - Title (1x)
+    - First paragraph (1x)
+    - Every major section of content (at least once per section)
+    - In at least 2-3 H2 or H3 headings
+    - In the conclusion paragraph (1x)
+    - Meta description (1x)
+    - CRITICAL: The primary keyword MUST appear AT LEAST 5-7 times across the entire content
+    - When appropriate, use both exact match and semantic variations of the keyword
+    IMPORTANT: DO NOT concentrate keyword usage only at the beginning and end - distribute evenly throughout all sections."""
+        else:
+            primary_keyword_instruction = "No primary keyword provided."
+        
+        # Create secondary keyword instructions separately
+        secondary_keywords_str = ", ".join(secondary_keywords) if secondary_keywords else "None provided"
+        
+        if secondary_keywords:
+            secondary_keyword_placement = """IMPORTANT: You MUST include EACH secondary keyword at least once in the optimized content. Place secondary keywords strategically in:
+   - At least 2-3 H2 or H3 headings
+   - Within paragraphs where they fit naturally
+   - In the FAQ section questions and answers (if present)"""
+            
+            priority_keywords = ", ".join(secondary_keywords[:5]) if len(secondary_keywords) > 5 else ", ".join(secondary_keywords)
+            priority_instruction = f"Priority secondary keywords (include these first):\n   {priority_keywords}"
+            
+            limit_instruction = "Limit each secondary keyword to maximum 2 mentions in the entire content."
+        else:
+            secondary_keyword_placement = "No secondary keywords provided."
+            priority_instruction = ""
+            limit_instruction = ""
+        
+        # Build the full prompt without nested f-strings
         prompt = f"""You are a Senior Thai SEO specialist focusing on crypto content. Optimize this Thai HTML content for SEO by following these strict requirements:
 
 1. Preserve HTML Structure
@@ -95,18 +128,13 @@ Content to optimize:
 
 6. Keyword Integration:
     Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
-    {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally throughout the ENTIRE content in the following way:\n    - Title (1x)\n    - First paragraph (1x)\n    - Every major section of content (at least once per section)\n    - In at least 2-3 H2 or H3 headings\n    - Meta description (1x)\n    IMPORTANT: DO NOT concentrate keyword usage only at the beginning and end - distribute evenly throughout all sections." if primary_keyword else "No primary keyword provided."}
+    {primary_keyword_instruction}
     
-   Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
-   {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the optimized content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
-   {f"   - At least 2-3 H2 or H3 headings" if secondary_keywords else ""}
-   {f"   - Within paragraphs where they fit naturally" if secondary_keywords else ""}
-   {f"   - In the FAQ section questions and answers (if present)" if secondary_keywords else ""}
+   Secondary Keywords: {secondary_keywords_str}
+   {secondary_keyword_placement}
+   {priority_instruction}
    
-   {f"Priority secondary keywords (include these first):" if secondary_keywords else ""}
-   {f"   {', '.join(secondary_keywords[:5]) if len(secondary_keywords) > 5 else ', '.join(secondary_keywords)}" if secondary_keywords else ""}
-   
-   {f"Limit each secondary keyword to maximum 2 mentions in the entire content." if secondary_keywords else ""}
+   {limit_instruction}
 
 7. VERY IMPORTANT: This is chunk of a larger HTML document. Optimize ONLY what's provided. Don't try to complete or start tags that seem incomplete - they will be joined with other chunks.
 
@@ -134,6 +162,7 @@ Content to optimize:
 {text}
 
 Return ONLY the JSON object, with no extra text or commentary."""
+
     
     client_config = init_openrouter_client()
     
@@ -244,13 +273,13 @@ def optimize_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=N
         result2 = optimize_chunk_with_fallback(chunk2, "", secondary_keywords, max_level-1)
         if result1 is None or result2 is None:
             return None
-        combined_html = result1['optimized_html'] + result2['optimized_html']
+        optimized_html = result1['optimized_html'] + result2['optimized_html']
         titles = result1['titles'] + result2['titles']
         meta_descriptions = result1['meta_descriptions'] + result2['meta_descriptions']
         alt_text = result1['alt_text'] if result1['alt_text'].strip() else result2['alt_text']
         wordpress_slug = result1.get('wordpress_slug', '') if result1.get('wordpress_slug', '').strip() else result2.get('wordpress_slug', '')
         return {
-            'optimized_html': combined_html,
+            'optimized_html': optimized_html,
             'titles': titles,
             'meta_descriptions': meta_descriptions,
             'alt_text': alt_text,
@@ -340,10 +369,37 @@ def smart_chunk_html(html_content: str, max_length: int) -> list:
     
     return chunks
 
+def count_keyword_occurrences(content: str, keywords: list) -> dict:
+    """
+    Count occurrences of each keyword in the content.
+    Returns a dictionary mapping keywords to occurrence counts.
+    """
+    if not content or not keywords:
+        return {}
+    
+    # Create soup to extract text content only (to ignore HTML tags)
+    if BeautifulSoup:
+        try:
+            soup = BeautifulSoup(content, "html.parser")
+            text_content = soup.get_text()
+        except:
+            text_content = content
+    else:
+        text_content = re.sub(r'<[^>]+>', '', content)  # Basic HTML tag removal fallback
+    
+    counts = {}
+    for keyword in keywords:
+        if keyword and keyword.strip():
+            counts[keyword] = text_content.count(keyword)
+    
+    return counts
+
 def optimize_content(content: str, primary_keyword: str = "", secondary_keywords: list = None) -> dict:
     """
     Optimize Thai HTML content for keywords. If content is too long, split it into chunks,
     optimize each using fallback logic, and combine results.
+    Ensures adequate primary keyword density throughout the content.
+    Compares keyword occurrences before and after optimization.
     """
     secondary_keywords = secondary_keywords or []
     content_hash = hashlib.md5(content.encode()).hexdigest()
@@ -598,29 +654,38 @@ if st.button("Optimize Content"):
                 
                 # Keyword usage analysis
                 if primary_keyword:
-                    primary_count = result['optimized_html'].lower().count(primary_keyword.lower())
-                    if primary_count == 0:
-                        st.warning(f"⚠️ Primary keyword '{primary_keyword}' is missing from the optimized content!")
+                    if BeautifulSoup:
+                        try:
+                            soup = BeautifulSoup(html_input, "html.parser")
+                            original_text = soup.get_text()
+                        except:
+                            original_text = html_input
                     else:
-                        st.info(f"✅ Primary keyword '{primary_keyword}' appears {primary_count} times in the optimized content.")
-                
-                # Check for missing secondary keywords
-                missing_keywords = []
-                for sec_keyword in secondary_keywords:
-                    sec_count = result['optimized_html'].lower().count(sec_keyword.lower())
-                    if sec_count == 0:
-                        missing_keywords.append(sec_keyword)
-                        st.warning(f"⚠️ Secondary keyword '{sec_keyword}' is missing from the optimized content!")
-                    else:
-                        st.info(f"✅ Secondary keyword '{sec_keyword}' appears {sec_count} times in the optimized content.")
-                
+                        original_text = re.sub(r'<[^>]+>', '', html_input)  # Basic HTML tag removal fallback
+                    
+                    primary_before = original_text.count(primary_keyword)
+                    primary_count = result['optimized_html'].count(primary_keyword)
+                    primary_status = '✅' if primary_count >= 3 else '⚠️'
+                    st.write(f"{primary_status} Primary keyword '{primary_keyword}' appears {primary_count} times in the optimized content (was {primary_before} before).")
+                    st.write("")
+
+                # Display secondary keyword stats
+                for keyword in secondary_keywords:
+                    if keyword:
+                        keyword_before = original_text.count(keyword) if 'original_text' in locals() else 0
+                        keyword_count = result['optimized_html'].count(keyword)
+                        keyword_status = '✅' if keyword_count >= 2 else '⚠️'
+                        st.write(f"{keyword_status} Secondary keyword '{keyword}' appears {keyword_count} times in the optimized content (was {keyword_before} before).")
+                st.write("")
+
                 # Summary of keyword coverage
                 if secondary_keywords:
+                    missing_keywords = [keyword for keyword in secondary_keywords if result['optimized_html'].count(keyword) == 0]
                     coverage = ((len(secondary_keywords) - len(missing_keywords)) / len(secondary_keywords)) * 100
                     if coverage == 100:
                         st.success(f"🎯 All keywords successfully integrated in the optimized content!")
                     else:
-                        st.info(f"Keyword coverage: {coverage:.1f}% ({len(secondary_keywords) - len(missing_keywords)}/{len(secondary_keywords)} keywords)")
+                        st.warning(f"⚠️ {coverage:.1f}% keyword coverage achieved. Missing keywords: {', '.join(missing_keywords)}.")
 
 with st.sidebar.expander("Optimization History"):
     if not st.session_state['history']:
