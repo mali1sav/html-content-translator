@@ -226,7 +226,7 @@ Content to translate:
 
 8. Keyword Integration:
    Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
-   {f"Ensure that the primary keyword '{primary_keyword}' appears naturally in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x). Maintain original language (whether Thai or English or mix)." if primary_keyword else "No primary keyword provided."}
+   {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally throughout the ENTIRE content in the following way:\n   - Title (1x)\n   - First paragraph (1x)\n   - Every major section of content (at least once per section)\n   - In at least 2-3 H2 or H3 headings\n   - Meta description (1x)\n   IMPORTANT: DO NOT concentrate keyword usage only at the beginning and end - distribute evenly throughout all sections. Maintain original language (whether Thai or English or mix)." if primary_keyword else "No primary keyword provided."}
    
    Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
    {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the translated content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
