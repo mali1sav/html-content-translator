@@ -6,7 +6,11 @@ import re
 import time
 import requests
 import hashlib
+import logging
 from io import StringIO
+from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional, Tuple
+
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -19,6 +23,53 @@ except ImportError:
         st.error("Failed to install BeautifulSoup. Falling back to basic chunking.")
         BeautifulSoup = None
 
+# Local imports
+try:
+    from link_validator import count_internal_links, extract_links_from_json_content
+except ImportError:
+    st.warning("Link validator module not found. Internal link functionality will be limited.")
+    
+    # Fallback implementations if import fails
+    def count_internal_links(html_content, site_base_path=""):
+        return 0, []
+    
+    def extract_links_from_json_content(json_content):
+        return []
+
+# --- Constants for Link Database ---
+DB_DIR = "link_databases"
+MAX_PER_KEYWORD = 5  # Max recent articles to keep per primary keyword
+MAX_SITE_ENTRIES = 40  # Max total recent articles to keep per site
+
+# Site-specific base paths (used to standardize URLs)
+SITE_BASE_PATHS = {
+    "ICOBENCH": "https://icobench.com/", 
+    "BITCOINIST": "https://bitcoinist.com/", 
+    "CRYPTODNES": "https://cryptodnes.bg/"
+}
+
+# WordPress API endpoints - update with your site configurations
+WP_API_ENDPOINTS = {
+    "ICOBENCH": {
+        "api_url": "https://icobench.com/wp-json/wp/v2/posts",
+        "username": "",  # Set via environment variable WP_ICOBENCH_USER
+        "app_password": ""  # Set via environment variable WP_ICOBENCH_PASSWORD
+    },
+    "BITCOINIST": {
+        "api_url": "https://bitcoinist.com/wp-json/wp/v2/posts",
+        "username": "",  # Set via environment variable WP_BITCOINIST_USER
+        "app_password": ""  # Set via environment variable WP_BITCOINIST_PASSWORD
+    },
+    "CRYPTODNES": {
+        "api_url": "https://cryptodnes.bg/wp-json/wp/v2/posts",
+        "username": "",  # Set via environment variable WP_CRYPTODNES_USER
+        "app_password": ""  # Set via environment variable WP_CRYPTODNES_PASSWORD
+    }
+}
+
+# --- Configure logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 def init_openrouter_client():
     """Initialize OpenRouter connection parameters"""
     api_key = os.getenv('OPENROUTER_API_KEY')
@@ -30,6 +81,206 @@ def init_openrouter_client():
         'default_model': "anthropic/claude-sonnet-4",
         'api_url': "https://openrouter.ai/api/v1/chat/completions"
     }
+
+def update_link_database(
+    site_name: str,
+    article_main_title: str,
+    article_meta_desc: str,
+    seo_slug: str,
+    primary_keyword: str,
+    wp_post_url: str = ""
+):
+    """
+    Updates the link database for the given site with the new article's details.
+
+    Args:
+        site_name: Name of the site (e.g., "ICOBENCH", "BITCOINIST", "CRYPTODNES").
+        article_main_title: The main title of the article.
+        article_meta_desc: Meta description.
+        seo_slug: SEO-friendly slug for the URL.
+        primary_keyword: Primary keyword for the article.
+        wp_post_url: WordPress post URL (if available).
+    """
+    if not site_name:
+        logging.error("[LinkDB] Site name is required to update link database.")
+        return
+
+    if not os.path.exists(DB_DIR):
+        try:
+            os.makedirs(DB_DIR)
+            logging.info(f"[LinkDB] Created directory: {DB_DIR}")
+        except OSError as e:
+            logging.error(f"[LinkDB] Error creating directory {DB_DIR}: {e}")
+            return
+
+    db_filename = f"{site_name.lower().replace(' ', '_')}_links.json"
+    db_path = os.path.join(DB_DIR, db_filename)
+
+    if not seo_slug:
+        logging.warning("[LinkDB] Could not update internal link database: Article slug missing.")
+        return
+
+    # Extract just the slug from seo_slug or wp_post_url
+    slug = seo_slug.strip('/') if seo_slug else wp_post_url.split('/')[-1].strip('/')
+    
+    # Create standardized URL format according to site type
+    if not slug:
+        logging.warning("[LinkDB] Cannot update link database: URL slug is missing.")
+        st.warning("Could not update internal link database: URL slug missing.")
+        return
+    
+    # Format the URL according to site requirements
+    site_key = site_name.upper()
+    
+    # ICOBench and CryptoNews should have /news/ prefix
+    if site_key in ["ICOBENCH", "CRYPTONEWS"]:
+        relative_path = f"/news/{slug}/"
+    else:
+        # Other sites just need the slug with leading slash
+        relative_path = f"/{slug}/"
+    
+    logging.info(f"[LinkDB] Standardized URL path for {site_key}: {relative_path}")
+
+    if not relative_path:
+        logging.warning("[LinkDB] Cannot update link database: Relative path is missing.")
+        st.warning("Could not update internal link database: Path missing.")
+        return
+
+    new_entry = {
+        "url": relative_path, # Standardized URL path format
+        "title": article_main_title,
+        "metaDescription": article_meta_desc,
+        "primaryKeyword": primary_keyword,
+        "site_name": site_name,
+        "publishedTimestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+    }
+
+    database: List[Dict[str, Any]] = []
+    if os.path.exists(db_path):
+        try:
+            with open(db_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                database = data
+            elif isinstance(data, dict) and 'links' in data and isinstance(data['links'], list):
+                database = data['links']
+                logging.info(f"[LinkDB] Loaded database with 'links' key structure. Found {len(database)} entries.")
+            else:
+                logging.warning(f"[LinkDB] {db_path} had unexpected structure. Resetting.")
+        except json.JSONDecodeError:
+            logging.warning(f"[LinkDB] {db_path} was corrupted or not valid JSON. Starting fresh.")
+        except Exception as e:
+            logging.error(f"[LinkDB] Error loading {db_path}: {e}")
+            st.error(f"Error loading link database {db_path}: {e}")
+            return
+
+    # Remove any existing entry with the same URL to avoid duplicates
+    database = [entry for entry in database if entry.get("url") != new_entry["url"]]
+    database.append(new_entry)
+
+    try:
+        # First sort all entries by timestamp (newest first)
+        database.sort(key=lambda x: x.get("publishedTimestamp", ""), reverse=True)
+        
+        # Group articles by primary keyword and keep only the 5 most recent per keyword
+        keyword_groups = {}
+        for entry in database:
+            keyword = entry.get("primaryKeyword", "").lower()
+            if keyword not in keyword_groups:
+                keyword_groups[keyword] = []
+            keyword_groups[keyword].append(entry)
+        
+        final_database = []
+        for keyword_entries in keyword_groups.values():
+            final_database.extend(keyword_entries[:MAX_PER_KEYWORD])
+        
+        # Sort all entries by timestamp again
+        final_database.sort(key=lambda x: x.get("publishedTimestamp", ""), reverse=True)
+        
+        # Apply the global MAX_SITE_ENTRIES limit
+        database = final_database[:MAX_SITE_ENTRIES]
+        
+    except Exception as e:
+        logging.error(f"[LinkDB] Error processing database, possibly due to malformed data: {e}")
+        # Fall back to the original behavior if there's an error
+        database = database[:MAX_SITE_ENTRIES]
+
+    try:
+        with open(db_path, 'w', encoding='utf-8') as f:
+            json.dump({"links": database}, f, ensure_ascii=False, indent=2)
+        logging.info(f"[LinkDB] Link database for {site_name} updated with '{new_entry['title']}'. Count: {len(database)}")
+        logging.info(f"[LinkDB] New entry URL structure: {new_entry['url']}")
+        logging.info(f"[LinkDB] seo_slug used: '{seo_slug[:30] if seo_slug else 'None'}'...")
+    except Exception as e:
+        logging.error(f"[LinkDB] Error writing to link database {db_path}: {e}")
+        st.error(f"Error writing to link database {db_path}: {e}")
+
+
+def get_relevant_internal_links(primary_keyword: str, site_name: str, max_links: int = 3) -> List[Dict[str, Any]]:
+    """
+    Retrieves relevant internal links from the link database based on primary keyword.
+    
+    Args:
+        primary_keyword: The primary keyword to match against
+        site_name: The site name to get links from
+        max_links: Maximum number of links to return
+        
+    Returns:
+        List of link entries matching the primary keyword
+    """
+    if not primary_keyword or not site_name:
+        return []
+        
+    db_filename = f"{site_name.lower().replace(' ', '_')}_links.json"
+    db_path = os.path.join(DB_DIR, db_filename)
+    
+    if not os.path.exists(db_path):
+        logging.warning(f"[LinkDB] No link database found for site {site_name}")
+        return []
+        
+    try:
+        with open(db_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        database = []
+        if isinstance(data, list):
+            database = data
+        elif isinstance(data, dict) and 'links' in data and isinstance(data['links'], list):
+            database = data['links']
+        else:
+            logging.warning(f"[LinkDB] Unexpected structure in {db_path}")
+            return []
+            
+        # First, look for exact primary keyword match
+        exact_matches = []
+        for entry in database:
+            if entry.get("primaryKeyword", "").lower() == primary_keyword.lower():
+                exact_matches.append(entry)
+                
+        # If we have enough exact matches, return those
+        if len(exact_matches) >= max_links:
+            return exact_matches[:max_links]
+            
+        # Otherwise look for partial matches to fill the remaining slots
+        partial_matches = []
+        remaining_slots = max_links - len(exact_matches)
+        
+        for entry in database:
+            if entry not in exact_matches:  # Avoid duplicates
+                entry_keyword = entry.get("primaryKeyword", "").lower()
+                if (primary_keyword.lower() in entry_keyword or 
+                    entry_keyword in primary_keyword.lower()):
+                    partial_matches.append(entry)
+                    if len(partial_matches) >= remaining_slots:
+                        break
+                        
+        # Combine exact and partial matches
+        result = exact_matches + partial_matches
+        return result[:max_links]  # Limit to max_links
+        
+    except Exception as e:
+        logging.error(f"[LinkDB] Error retrieving internal links: {e}")
+        return []
 
 def extract_json_safely(resp_text):
     """
@@ -53,9 +304,30 @@ def extract_json_safely(resp_text):
         st.error(f"JSON extraction error: {str(e)}")
         return None
 
-def _optimize_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False) -> dict:
+def _optimize_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False, internal_links: list = None, site_name: str = None) -> dict:
     """Optimize a single chunk of Thai HTML content using Claude via OpenRouter with retries."""
     secondary_keywords = secondary_keywords or []
+    internal_links = internal_links or []
+    
+    # Format internal links for prompt if available
+    internal_links_instruction = ""
+    if internal_links and len(internal_links) > 0 and site_name:
+        base_url = SITE_BASE_PATHS.get(site_name.upper(), "")
+        internal_links_json = json.dumps(internal_links, ensure_ascii=False)[:1500]  # Limit size
+        
+        internal_links_instruction = f"""
+8. Internal Link Integration:
+        Insert {min(len(internal_links), 3)} internal links from the provided list as naturally as possible. Follow these rules:
+        - Place links in relevant sections where they naturally fit with the content topic
+        - Use the article title as anchor text or a relevant portion of it
+        - DO NOT place links in headings or image captions
+        - DO NOT modify the URLs in any way - use them exactly as provided
+        - Format links as standard HTML: <a href="{base_url}[url-from-json]">[title]</a>
+        - The base URL is already: {base_url}
+        
+        Available internal links (JSON format):
+        {internal_links_json}
+        """
     
     if simplified_mode:
         # Use a simpler prompt with fewer requirements for problematic chunks
@@ -116,7 +388,7 @@ Content to optimize:
    Keep all HTML tags, attributes, and inline styles completely unchanged. Do not modify the HTML in any way except to optimize the visible Thai text.
 
 2. Retain Technical Content
-   Do not modify any technical elements such as URLs, placeholders (e.g., [cur_year], {{{{variable}}}}), and shortcodes (e.g., [su_note], [toc]). They must remain exactly as they are.
+   Do not modify any technical elements such as URLs, placeholders (e.g., [cur_year], {{{{variable}}}}, and shortcodes (e.g., [su_note], [toc]). They must remain exactly as they are.
 
 3. Keep Entity Names (people, places, organisation), Brands, coin names, and Technical Terms in English.
 
@@ -136,7 +408,7 @@ Content to optimize:
    
    {limit_instruction}
 
-7. VERY IMPORTANT: This is chunk of a larger HTML document. Optimize ONLY what's provided. Don't try to complete or start tags that seem incomplete - they will be joined with other chunks.
+7. VERY IMPORTANT: This is chunk of a larger HTML document. Optimize ONLY what's provided. Don't try to complete or start tags that seem incomplete - they will be joined with other chunks.{internal_links_instruction}
 
 Return exactly a valid JSON object matching the following schema without any additional text:
 {{
@@ -253,14 +525,15 @@ Return ONLY the JSON object, with no extra text or commentary."""
         return result
     return None
 
-def optimize_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=None, max_level=3):
+def optimize_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=None, max_level=3, site_name=None, internal_links=None):
     """
     Attempts to optimize a chunk using _optimize_single.
     If optimization fails and max_level is not exceeded, the chunk is split into halves recursively.
     Returns a dictionary with combined optimized_html and aggregated SEO elements or None if optimization fails.
     """
     secondary_keywords = secondary_keywords or []
-    result = _optimize_single(chunk, primary_keyword, secondary_keywords)
+    internal_links = internal_links or []
+    result = _optimize_single(chunk, primary_keyword, secondary_keywords, internal_links=internal_links, site_name=site_name)
     if result is not None:
         return result
     else:
@@ -269,8 +542,8 @@ def optimize_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=N
         mid = len(chunk) // 2
         chunk1 = chunk[:mid]
         chunk2 = chunk[mid:]
-        result1 = optimize_chunk_with_fallback(chunk1, primary_keyword, secondary_keywords, max_level-1)
-        result2 = optimize_chunk_with_fallback(chunk2, "", secondary_keywords, max_level-1)
+        result1 = optimize_chunk_with_fallback(chunk1, primary_keyword, secondary_keywords, max_level-1, site_name=site_name)
+        result2 = optimize_chunk_with_fallback(chunk2, "", secondary_keywords, max_level-1, site_name=site_name)
         if result1 is None or result2 is None:
             return None
         optimized_html = result1['optimized_html'] + result2['optimized_html']
@@ -394,21 +667,37 @@ def count_keyword_occurrences(content: str, keywords: list) -> dict:
     
     return counts
 
-def optimize_content(content: str, primary_keyword: str = "", secondary_keywords: list = None) -> dict:
+def optimize_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, site_name: str = None) -> dict:
     """
     Optimize Thai HTML content for keywords. If content is too long, split it into chunks,
     optimize each using fallback logic, and combine results.
     Ensures adequate primary keyword density throughout the content.
     Compares keyword occurrences before and after optimization.
+    
+    Args:
+        content: The HTML content to optimize
+        primary_keyword: The primary keyword to optimize for
+        secondary_keywords: List of secondary keywords
+        site_name: Site name for internal link lookup (optional)
     """
     secondary_keywords = secondary_keywords or []
     content_hash = hashlib.md5(content.encode()).hexdigest()
     keywords_hash = hashlib.md5(f"{primary_keyword}{''.join(secondary_keywords)}".encode()).hexdigest()
-    cache_key = f"optimization_cache_{content_hash}_{keywords_hash}"
+    site_hash = hashlib.md5(f"{site_name or ''}".encode()).hexdigest()[:8]
+    cache_key = f"optimization_cache_{content_hash}_{keywords_hash}_{site_hash}"
     cached_result = st.session_state.get(cache_key)
     if cached_result:
         st.success("Retrieved from cache!")
         return cached_result
+        
+    # Get internal links if site name is provided
+    internal_links = []
+    if site_name and primary_keyword:
+        internal_links = get_relevant_internal_links(primary_keyword, site_name, max_links=3)
+        if internal_links:
+            logging.info(f"[InternalLinks] Found {len(internal_links)} relevant internal links for keyword '{primary_keyword}' on site '{site_name}'")
+        else:
+            logging.info(f"[InternalLinks] No relevant internal links found for keyword '{primary_keyword}' on site '{site_name}'")
     
     total_length = len(content)
     if total_length < 10000:
@@ -419,7 +708,7 @@ def optimize_content(content: str, primary_keyword: str = "", secondary_keywords
         CHUNK_LIMIT = 10000  # Significantly reduced from 30000
     
     if total_length <= CHUNK_LIMIT:
-        result = optimize_chunk_with_fallback(content, primary_keyword, secondary_keywords)
+        result = optimize_chunk_with_fallback(content, primary_keyword, secondary_keywords, internal_links=internal_links, site_name=site_name)
         if result:
             st.session_state[cache_key] = result
         return result
@@ -448,8 +737,11 @@ def optimize_content(content: str, primary_keyword: str = "", secondary_keywords
             if primary_keyword and not primary_keyword_inserted and i == 0:
                 chunk_primary = primary_keyword
                 primary_keyword_inserted = True
+                
+            # Only pass internal links to the first chunk to avoid duplicate links
+            chunk_internal_links = internal_links if i == 0 and internal_links else []
             
-            result = optimize_chunk_with_fallback(chunk, chunk_primary, secondary_keywords)
+            result = optimize_chunk_with_fallback(chunk, chunk_primary, secondary_keywords, site_name=site_name, internal_links=chunk_internal_links)
             if result is None:
                 failed_chunks.append(i)
                 continue
@@ -536,9 +828,31 @@ def optimize_content(content: str, primary_keyword: str = "", secondary_keywords
         st.session_state[cache_key] = final_result
         return final_result
 
+# Make sure the link database directory exists
+os.makedirs(DB_DIR, exist_ok=True)
+
 # Initialize optimization history cache
 if 'history' not in st.session_state:
     st.session_state['history'] = []
+
+# Load WordPress credentials if available
+def init_wordpress_credentials():
+    # For each site in WP_API_ENDPOINTS, get credentials from environment variables
+    for site, config in WP_API_ENDPOINTS.items():
+        user_env = f"WP_{site}_USER"
+        pass_env = f"WP_{site}_PASSWORD"
+        
+        username = os.getenv(user_env)
+        app_password = os.getenv(pass_env)
+        
+        if username and app_password:
+            WP_API_ENDPOINTS[site]["username"] = username
+            WP_API_ENDPOINTS[site]["app_password"] = app_password
+            logging.info(f"Loaded WordPress credentials for {site}")
+        else:
+            logging.warning(f"WordPress credentials not found for {site}. Set {user_env} and {pass_env} environment variables.")
+    
+    return WP_API_ENDPOINTS
 
 # Initialize OpenRouter client
 try:
@@ -582,6 +896,100 @@ if keywords:
     if secondary_keywords:
         st.info(f"Secondary keywords: {', '.join(secondary_keywords)}")
 
+# Site selection for internal linking
+site_options = ["None"] + list(SITE_BASE_PATHS.keys())
+selected_site = st.selectbox(
+    "Select site for internal linking (optional):", 
+    options=site_options,
+    help="Select a site to enable internal linking. This will fetch relevant internal links from your link database."
+)
+site_name = None if selected_site == "None" else selected_site
+
+# Check if link database exists for the selected site
+if site_name:
+    db_filename = f"{site_name.lower().replace(' ', '_')}_links.json"
+    db_path = os.path.join(DB_DIR, db_filename)
+    if os.path.exists(db_path):
+        try:
+            with open(db_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            database = []
+            if isinstance(data, list):
+                database = data
+            elif isinstance(data, dict) and 'links' in data and isinstance(data['links'], list):
+                database = data['links']
+            st.success(f"Found {len(database)} internal links in database for {site_name}")
+        except Exception as e:
+            st.warning(f"Error reading link database: {e}")
+    else:
+        st.warning(f"No link database found for {site_name}. Internal links will not be added.")
+
+# WordPress submission functionality
+def submit_to_wordpress(site_name, title, content, excerpt="", status="draft", categories=None, tags=None):
+    """
+    Submit a post to WordPress via REST API
+    
+    Args:
+        site_name: Name of the site (must match a key in WP_API_ENDPOINTS)
+        title: Post title
+        content: Post content (HTML)
+        excerpt: Post excerpt/summary
+        status: Post status (draft, publish, etc)
+        categories: List of category IDs
+        tags: List of tag IDs
+    
+    Returns:
+        Response from WordPress API or None if submission failed
+    """
+    site_config = WP_API_ENDPOINTS.get(site_name.upper())
+    if not site_config:
+        logging.error(f"No WordPress configuration found for site: {site_name}")
+        return None
+    
+    if not site_config.get("username") or not site_config.get("app_password"):
+        logging.error(f"WordPress credentials missing for {site_name}")
+        return None
+    
+    # Prepare post data
+    post_data = {
+        "title": title,
+        "content": content,
+        "status": status
+    }
+    
+    if excerpt:
+        post_data["excerpt"] = excerpt
+        
+    if categories:
+        post_data["categories"] = categories
+        
+    if tags:
+        post_data["tags"] = tags
+    
+    # Set up authentication
+    auth = (site_config["username"], site_config["app_password"])
+    
+    try:
+        # Send POST request to WordPress API
+        response = requests.post(
+            site_config["api_url"],
+            json=post_data,
+            auth=auth,
+            headers={"Content-Type": "application/json"}
+        )
+        
+        # Check response
+        if response.status_code in [200, 201]:
+            logging.info(f"Successfully submitted post to {site_name}")
+            return response.json()
+        else:
+            logging.error(f"WordPress API error: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        logging.error(f"Error submitting to WordPress: {str(e)}")
+        return None
+
 with st.expander("Advanced Options"):
     st.info("These settings help optimize processing of very large documents.")
     save_intermediate = st.checkbox("Save intermediate results (recommended for large files)", value=True)
@@ -606,7 +1014,7 @@ if st.button("Optimize Content"):
         start_time = time.time()
         with st.spinner("Analyzing document..."):
             try:
-                result = optimize_content(html_input, primary_keyword, secondary_keywords)
+                result = optimize_content(html_input, primary_keyword, secondary_keywords, site_name=site_name)
             except Exception as e:
                 st.error(f"Optimization failed: {str(e)}")
                 result = None
@@ -616,14 +1024,30 @@ if st.button("Optimize Content"):
 
             if result:
                 st.success(f"Optimization complete in {process_time:.1f} seconds!")
-                
+                # Save the result to history
                 history_entry = {
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'input_length': len(html_input),
                     'output_length': len(result['optimized_html']),
                     'keyword': primary_keyword if primary_keyword else "None",
+                    'site_name': site_name if site_name else "None",
                     'process_time': process_time
                 }
+                
+                # If site_name and a valid WordPress slug are provided, offer to update the link database
+                if site_name and result.get('wordpress_slug') and primary_keyword and any(result.get('titles', [])):
+                    if st.button("Update Link Database"):
+                        main_title = result['titles'][0] if result['titles'] else ""
+                        meta_desc = result['meta_descriptions'][0] if result['meta_descriptions'] else ""
+                        update_link_database(
+                            site_name=site_name,
+                            article_main_title=main_title,
+                            article_meta_desc=meta_desc,
+                            seo_slug=result.get('wordpress_slug', ""),
+                            primary_keyword=primary_keyword
+                        )
+                        st.success(f"Link database updated for {site_name} with keyword '{primary_keyword}'")
+                
                 st.session_state['history'].append(history_entry)
                 
                 col1, col2 = st.columns(2)
@@ -651,6 +1075,17 @@ if st.button("Optimize Content"):
                     st.write("Meta Descriptions:", result['meta_descriptions'])
                     st.write("Alt Text:", result['alt_text'])
                     st.write("WordPress Slug:", result.get('wordpress_slug', ''))
+                    
+                    # Check if internal links were successfully inserted
+                    if site_name:
+                        internal_link_count, internal_urls = count_internal_links(result['optimized_html'], SITE_BASE_PATHS.get(site_name.upper(), ""))
+                        if internal_link_count > 0:
+                            st.success(f"✅ Successfully inserted {internal_link_count} internal links")
+                            with st.expander("Internal Links Details"):
+                                for i, url in enumerate(internal_urls):
+                                    st.write(f"{i+1}. {url}")
+                        else:
+                            st.warning("⚠️ No internal links were inserted. The content may not have had suitable placement opportunities.")
                 
                 # Keyword usage analysis
                 if primary_keyword:
@@ -686,6 +1121,93 @@ if st.button("Optimize Content"):
                         st.success(f"🎯 All keywords successfully integrated in the optimized content!")
                     else:
                         st.warning(f"⚠️ {coverage:.1f}% keyword coverage achieved. Missing keywords: {', '.join(missing_keywords)}.")
+
+                # WordPress submission section
+                with st.expander("Submit to WordPress", expanded=False):
+                    st.write("Submit this optimized content to WordPress:")
+                    title_input = st.text_input("Post Title", 
+                                             value=result.get('titles', [''])[0] if result.get('titles') else "")
+                    
+                    # Allow the user to select a site for submission
+                    site_options = list(WP_API_ENDPOINTS.keys())
+                    selected_site = st.selectbox("Select WordPress site", options=site_options)
+                    
+                    status_options = ["draft", "publish", "pending"]
+                    status = st.selectbox("Post Status", options=status_options, index=0)
+                    
+                    meta_desc = result.get('meta_descriptions', [''])[0] if result.get('meta_descriptions') else ""
+                    excerpt = st.text_area("Excerpt/Summary", value=meta_desc, height=100)
+                    
+                    if st.button("Submit to WordPress"):
+                        if selected_site:
+                            # First initialize credentials
+                            init_wordpress_credentials()
+                            
+                            site_config = WP_API_ENDPOINTS.get(selected_site)
+                            if not site_config:
+                                st.error(f"No API endpoint configured for {selected_site}")
+                            elif not site_config.get("username") or not site_config.get("app_password"):
+                                st.error(f"WordPress credentials missing for {selected_site}. Please set environment variables.")
+                            else:
+                                with st.spinner("Submitting to WordPress..."):
+                                    wp_response = submit_to_wordpress(
+                                        site_name=selected_site,
+                                        title=title_input,
+                                        content=result['optimized_html'],
+                                        excerpt=excerpt,
+                                        status=status
+                                    )
+                                    
+                                    if wp_response:
+                                        post_url = wp_response.get('link', '')
+                                        st.success(f"Post created successfully! URL: {post_url}")
+                                        
+                                        # Display post details
+                                        post_details = {
+                                            "title": wp_response['title']['rendered'] if 'title' in wp_response else title_input,
+                                            "id": wp_response.get('id', ''),
+                                            "status": wp_response.get('status', status),
+                                            "url": post_url
+                                        }
+                                        st.json(post_details)
+                                        
+                                        # Update internal link database
+                                        # Check if the selected site corresponds to a site in SITE_BASE_PATHS
+                                        site_name_for_links = None
+                                        for site_key in SITE_BASE_PATHS.keys():
+                                            if site_key.upper() == selected_site.upper():
+                                                site_name_for_links = site_key
+                                                break
+                                        
+                                        if site_name_for_links and primary_keyword:
+                                            try:
+                                                # Extract slug from response or use the one from optimization
+                                                seo_slug = result.get('wordpress_slug', "")
+                                                if not seo_slug and post_url:
+                                                    slug_match = re.search(r'/([^/]+)/?$', post_url)
+                                                    if slug_match:
+                                                        seo_slug = slug_match.group(1)
+                                                
+                                                update_link_database(
+                                                    site_name=site_name_for_links,
+                                                    article_main_title=title_input,
+                                                    article_meta_desc=excerpt,
+                                                    seo_slug=seo_slug,
+                                                    primary_keyword=primary_keyword,
+                                                    wp_post_url=post_url
+                                                )
+                                                st.success(f"🔗 Updated internal link database for {site_name_for_links} with keyword '{primary_keyword}'")
+                                                
+                                                # Show current links in database for this keyword
+                                                relevant_links = get_relevant_internal_links(primary_keyword, site_name_for_links)
+                                                if relevant_links:
+                                                    with st.expander(f"Current internal links for keyword '{primary_keyword}'"):
+                                                        for i, link in enumerate(relevant_links):
+                                                            st.write(f"{i+1}. {link['title']} - {link['url']}")
+                                            except Exception as e:
+                                                st.warning(f"Failed to update internal link database: {str(e)}")
+                                    else:
+                                        st.error("Failed to submit to WordPress. Check logs for details.")
 
 with st.sidebar.expander("Optimization History"):
     if not st.session_state['history']:
