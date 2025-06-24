@@ -311,8 +311,7 @@ def _optimize_single(text: str, primary_keyword: str = "", secondary_keywords: l
     
     # Format internal links for prompt if available
     internal_links_instruction = ""
-    if internal_links and len(internal_links) > 0 and site_name:
-        base_url = SITE_BASE_PATHS.get(site_name.upper(), "")
+    if internal_links and len(internal_links) > 0:
         internal_links_json = json.dumps(internal_links, ensure_ascii=False)[:1500]  # Limit size
         
         internal_links_instruction = f"""
@@ -322,8 +321,7 @@ def _optimize_single(text: str, primary_keyword: str = "", secondary_keywords: l
         - Use the article title as anchor text or a relevant portion of it
         - DO NOT place links in headings or image captions
         - DO NOT modify the URLs in any way - use them exactly as provided
-        - Format links as standard HTML: <a href="{base_url}[url-from-json]">[title]</a>
-        - The base URL is already: {base_url}
+        - Format links as standard HTML: <a href="[url-from-json]">[title]</a>
         
         Available internal links (JSON format):
         {internal_links_json}
@@ -667,7 +665,7 @@ def count_keyword_occurrences(content: str, keywords: list) -> dict:
     
     return counts
 
-def optimize_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, site_name: str = None) -> dict:
+def optimize_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, internal_links: list = None) -> dict:
     """
     Optimize Thai HTML content for keywords. If content is too long, split it into chunks,
     optimize each using fallback logic, and combine results.
@@ -690,14 +688,12 @@ def optimize_content(content: str, primary_keyword: str = "", secondary_keywords
         st.success("Retrieved from cache!")
         return cached_result
         
-    # Get internal links if site name is provided
-    internal_links = []
-    if site_name and primary_keyword:
-        internal_links = get_relevant_internal_links(primary_keyword, site_name, max_links=3)
-        if internal_links:
-            logging.info(f"[InternalLinks] Found {len(internal_links)} relevant internal links for keyword '{primary_keyword}' on site '{site_name}'")
-        else:
-            logging.info(f"[InternalLinks] No relevant internal links found for keyword '{primary_keyword}' on site '{site_name}'")
+    # Use manually entered internal links if provided
+    if internal_links:
+        logging.info(f"[InternalLinks] Using {len(internal_links)} manually entered internal links")
+    else:
+        internal_links = []
+        logging.info("[InternalLinks] No internal links provided")
     
     total_length = len(content)
     if total_length < 10000:
@@ -896,33 +892,31 @@ if keywords:
     if secondary_keywords:
         st.info(f"Secondary keywords: {', '.join(secondary_keywords)}")
 
-# Site selection for internal linking
-site_options = ["None"] + list(SITE_BASE_PATHS.keys())
-selected_site = st.selectbox(
-    "Select site for internal linking (optional):", 
-    options=site_options,
-    help="Select a site to enable internal linking. This will fetch relevant internal links from your link database."
-)
-site_name = None if selected_site == "None" else selected_site
-
-# Check if link database exists for the selected site
-if site_name:
-    db_filename = f"{site_name.lower().replace(' ', '_')}_links.json"
-    db_path = os.path.join(DB_DIR, db_filename)
-    if os.path.exists(db_path):
-        try:
-            with open(db_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            database = []
-            if isinstance(data, list):
-                database = data
-            elif isinstance(data, dict) and 'links' in data and isinstance(data['links'], list):
-                database = data['links']
-            st.success(f"Found {len(database)} internal links in database for {site_name}")
-        except Exception as e:
-            st.warning(f"Error reading link database: {e}")
-    else:
-        st.warning(f"No link database found for {site_name}. Internal links will not be added.")
+# Manual internal link input
+with st.expander("Add/Update Internal Links"):
+    st.info("Paste a list of internal links below (Title on one line, URL on the next). The AI will intelligently insert them into the article above.")
+    
+    internal_links_input = st.text_area(
+        "Potential Internal Links (Title/URL pairs):",
+        height=200,
+        help="Enter each link as a pair: title on one line, full URL on the next line"
+    )
+    
+    # Process the internal links input into a usable format
+    manual_internal_links = []
+    
+    if internal_links_input:
+        lines = internal_links_input.strip().split('\n')
+        for i in range(0, len(lines) - 1, 2):
+            if i + 1 < len(lines):  # Make sure we have a pair
+                title = lines[i].strip()
+                url = lines[i + 1].strip()
+                if title and url:  # Both title and URL must be non-empty
+                    manual_internal_links.append({
+                        "title": title,
+                        "url": url,
+                        "keywords": []  # No keywords associated with manual links
+                    })
 
 # WordPress submission functionality
 def submit_to_wordpress(site_name, title, content, excerpt="", status="draft", categories=None, tags=None):
@@ -1014,7 +1008,7 @@ if st.button("Optimize Content"):
         start_time = time.time()
         with st.spinner("Analyzing document..."):
             try:
-                result = optimize_content(html_input, primary_keyword, secondary_keywords, site_name=site_name)
+                result = optimize_content(html_input, primary_keyword, secondary_keywords, internal_links=manual_internal_links)
             except Exception as e:
                 st.error(f"Optimization failed: {str(e)}")
                 result = None
@@ -1034,20 +1028,7 @@ if st.button("Optimize Content"):
                     'process_time': process_time
                 }
                 
-                # If site_name and a valid WordPress slug are provided, offer to update the link database
-                if site_name and result.get('wordpress_slug') and primary_keyword and any(result.get('titles', [])):
-                    if st.button("Update Link Database"):
-                        main_title = result['titles'][0] if result['titles'] else ""
-                        meta_desc = result['meta_descriptions'][0] if result['meta_descriptions'] else ""
-                        update_link_database(
-                            site_name=site_name,
-                            article_main_title=main_title,
-                            article_meta_desc=meta_desc,
-                            seo_slug=result.get('wordpress_slug', ""),
-                            primary_keyword=primary_keyword
-                        )
-                        st.success(f"Link database updated for {site_name} with keyword '{primary_keyword}'")
-                
+
                 st.session_state['history'].append(history_entry)
                 
                 col1, col2 = st.columns(2)
@@ -1077,12 +1058,18 @@ if st.button("Optimize Content"):
                     st.write("WordPress Slug:", result.get('wordpress_slug', ''))
                     
                     # Check if internal links were successfully inserted
-                    if site_name:
-                        internal_link_count, internal_urls = count_internal_links(result['optimized_html'], SITE_BASE_PATHS.get(site_name.upper(), ""))
-                        if internal_link_count > 0:
-                            st.success(f"✅ Successfully inserted {internal_link_count} internal links")
+                    if manual_internal_links:
+                        # Check each URL from our manual links
+                        inserted_links = []
+                        for link in manual_internal_links:
+                            url = link['url']
+                            if url in result['optimized_html']:
+                                inserted_links.append(url)
+                        
+                        if inserted_links:
+                            st.success(f"✅ Successfully inserted {len(inserted_links)} internal links")
                             with st.expander("Internal Links Details"):
-                                for i, url in enumerate(internal_urls):
+                                for i, url in enumerate(inserted_links):
                                     st.write(f"{i+1}. {url}")
                         else:
                             st.warning("⚠️ No internal links were inserted. The content may not have had suitable placement opportunities.")
