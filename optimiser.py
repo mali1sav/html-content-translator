@@ -665,7 +665,7 @@ def count_keyword_occurrences(content: str, keywords: list) -> dict:
     
     return counts
 
-def optimize_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, internal_links: list = None) -> dict:
+def optimize_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, internal_links: list = None, site_name: str = None) -> dict:
     """
     Optimize Thai HTML content for keywords. If content is too long, split it into chunks,
     optimize each using fallback logic, and combine results.
