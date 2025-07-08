@@ -26,7 +26,7 @@ def init_openrouter_client():
         raise ValueError("OpenRouter API key not found")
     
     # Get model from environment variable or use default
-    model = os.getenv('OPENROUTER_MODEL', "anthropic/claude-sonnet-4")
+    model = os.getenv('OPENROUTER_MODEL', "google/gemini-2.5-pro-preview")
     
     return {
         'api_key': api_key,
@@ -48,7 +48,9 @@ def extract_json_safely(resp_text):
         # First, try to load the entire response as JSON
         parsed = json.loads(resp_text, strict=False)
         if isinstance(parsed, dict) and 'translated_html' in parsed:
-            return parsed
+            # Validate that the result is complete
+            if _validate_translation_result(parsed):
+                return parsed
     except json.JSONDecodeError:
         # Continue with extraction methods if direct loading fails
         pass
@@ -92,31 +94,49 @@ def extract_json_safely(resp_text):
 
         # Clean control characters
         json_str = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', json_str)
+        
+        # Fix common JSON issues with HTML attributes
+        json_str = _fix_json_html_attributes(json_str)
 
         try:
             # Try parsing the extracted JSON
             parsed = json.loads(json_str, strict=False)
             if isinstance(parsed, dict) and 'translated_html' in parsed:
-                return parsed
+                # Validate that the result is complete
+                if _validate_translation_result(parsed):
+                    return parsed
+                else:
+                    st.warning("Method 2: Extracted JSON failed validation")
+                    return None
         except json.JSONDecodeError as e:
             st.warning(f"Method 2 JSON parse error: {e}. Preview: {json_str[:200]}...")
+            # Don't continue to Method 3 if we had a JSON structure but it was malformed
+            return None
 
     except Exception as e:
         st.warning(f"Method 2 error: {str(e)}")
     
-    # Method 3: Manual JSON construction from the response text
+    # Method 3: Manual JSON construction from the response text (only if Method 2 didn't find JSON structure)
     try:
         # Look for the translated_html key specifically since that's what we need
-        translated_html_match = re.search(r'"translated_html"\s*:\s*"(.*?)(?<!\\)"', resp_text, re.DOTALL)
+        translated_html_match = re.search(r'"translated_html"\s*:\s*"(.*?)(?<!\\)"(?=\s*,|\s*})', resp_text, re.DOTALL)
         titles_match = re.search(r'"titles"\s*:\s*\[(.*?)\]', resp_text, re.DOTALL)
         meta_desc_match = re.search(r'"meta_descriptions"\s*:\s*\[(.*?)\]', resp_text, re.DOTALL)
-        alt_text_match = re.search(r'"alt_text"\s*:\s*"(.*?)(?<!\\)"', resp_text, re.DOTALL)
-        wp_slug_match = re.search(r'"wordpress_slug"\s*:\s*"(.*?)(?<!\\)"', resp_text, re.DOTALL)
+        alt_text_match = re.search(r'"alt_text"\s*:\s*"(.*?)(?<!\\)"(?=\s*,|\s*})', resp_text, re.DOTALL)
+        wp_slug_match = re.search(r'"wordpress_slug"\s*:\s*"(.*?)(?<!\\)"(?=\s*,|\s*})', resp_text, re.DOTALL)
         
         # If we have at least the translated_html key, we can create a valid response
         if translated_html_match:
             result = {}
-            result['translated_html'] = html.unescape(translated_html_match.group(1))
+            
+            # Extract and validate translated_html
+            html_content = translated_html_match.group(1)
+            # Check if the HTML content seems complete (not cut off mid-tag)
+            if not _is_html_content_complete(html_content):
+                st.warning("Method 3: HTML content appears incomplete")
+                return None
+                
+            result['translated_html'] = html.unescape(html_content)
             
             # Extract titles, handling potential HTML and quotes
             if titles_match:
@@ -160,13 +180,80 @@ def extract_json_safely(resp_text):
                 else:
                     result['wordpress_slug'] = "default-slug"
             
-            return result
+            # Final validation
+            if _validate_translation_result(result):
+                return result
+            else:
+                st.warning("Method 3: Constructed result failed validation")
+                return None
+                
     except Exception as e:
         st.warning(f"Method 3 error: {str(e)}")
     
     # If all methods fail, log the response for debugging and return None
     st.error(f"All extraction methods failed. First 300 chars of response: {resp_text[:300]}")
     return None
+
+def _fix_json_html_attributes(json_str):
+    """Fix common JSON issues with HTML attributes containing quotes."""
+    # This is a simple fix for the most common case: style attributes with unescaped quotes
+    # Replace unescaped quotes in style attributes
+    json_str = re.sub(r'style="([^"]*)"([^"]*)"([^"]*)"', r'style="\1\\\"\2\\\"\3"', json_str)
+    
+    # Fix other common HTML attribute quote issues
+    json_str = re.sub(r'(href|src|alt|title|class|id)="([^"]*)"([^"]*)"([^"]*)"', r'\1="\2\\\"\3\\\"\4"', json_str)
+    
+    return json_str
+
+def _is_html_content_complete(html_content):
+    """Check if HTML content appears to be complete (not truncated)."""
+    # Check for incomplete tags at the end
+    if html_content.endswith('<') or html_content.endswith('</'):
+        return False
+    
+    # Check for incomplete table structures
+    if '<table>' in html_content and '</table>' not in html_content:
+        return False
+    
+    # Check for incomplete div structures
+    open_divs = html_content.count('<div')
+    close_divs = html_content.count('</div>')
+    if open_divs > close_divs + 2:  # Allow some tolerance
+        return False
+    
+    # Check if content ends abruptly (very short content might be truncated)
+    if len(html_content.strip()) < 50:
+        return False
+    
+    return True
+
+def _validate_translation_result(result):
+    """Validate that a translation result is complete and valid."""
+    if not isinstance(result, dict):
+        return False
+    
+    # Check required fields
+    required_fields = ['translated_html', 'titles', 'meta_descriptions', 'alt_text']
+    for field in required_fields:
+        if field not in result:
+            return False
+    
+    # Check that translated_html is not empty and appears complete
+    html_content = result.get('translated_html', '')
+    if not html_content or len(html_content.strip()) < 50:
+        return False
+    
+    # Check if HTML content appears complete
+    if not _is_html_content_complete(html_content):
+        return False
+    
+    # Check that lists are actually lists
+    if not isinstance(result.get('titles'), list):
+        return False
+    if not isinstance(result.get('meta_descriptions'), list):
+        return False
+    
+    return True
 
 def _translate_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False) -> dict:
     """Translate a single chunk of HTML content using Claude via OpenRouter with retries."""
@@ -226,7 +313,7 @@ Content to translate:
 
 8. Keyword Integration:
    Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
-   {f"Ensure that the primary keyword '{primary_keyword}' is integrated naturally throughout the ENTIRE content in the following way:\n   - Title (1x)\n   - First paragraph (1x)\n   - Every major section of content (at least once per section)\n   - In at least 2-3 H2 or H3 headings\n   - Meta description (1x)\n   IMPORTANT: DO NOT concentrate keyword usage only at the beginning and end - distribute evenly throughout all sections. Maintain original language (whether Thai or English or mix)." if primary_keyword else "No primary keyword provided."}
+   {f"Ensure that the primary keyword '{primary_keyword}' appears naturally in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x). Maintain original language (whether Thai or English or mix)." if primary_keyword else "No primary keyword provided."}
    
    Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
    {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the translated content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
