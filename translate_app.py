@@ -7,6 +7,44 @@ import time
 import requests
 import hashlib
 from io import StringIO
+
+# ----------------------
+# Utility: Clean HTML output
+# ----------------------
+
+def clean_html_output(html_content: str) -> str:
+    """Remove editor artefacts such as emoji <img> tags, redundant <span> wrappers and excessive new-lines.
+    Falls back gracefully if BeautifulSoup is unavailable."""
+    if not html_content:
+        return html_content
+
+    try:
+        cleaned = html_content
+        if 'BeautifulSoup' in globals() and BeautifulSoup:
+            soup = BeautifulSoup(cleaned, 'html.parser')
+
+            # 1. Remove <img> with class that includes "emoji"
+            for img in soup.find_all('img'):
+                classes = img.get('class', []) or []
+                if any('emoji' in c for c in classes):
+                    img.decompose()
+
+            # 2. Unwrap <span> that only force font weight styling (Word docs etc.)
+            for span in soup.find_all('span'):
+                style = span.get('style', '') or ''
+                if 'font-weight' in style:
+                    span.unwrap()
+
+            cleaned = str(soup)
+        # Regex fallbacks / extra cleaning
+        cleaned = re.sub(r'<img[^>]*class="emoji"[^>]*>', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'<span[^>]*font-weight:[^>]*>(.*?)</span>', r'\1', cleaned, flags=re.IGNORECASE | re.DOTALL)
+        # Collapse multiple new-lines
+        cleaned = re.sub(r'\n+', '\n', cleaned)
+        return cleaned
+    except Exception:
+        # In worst case, just return original
+        return html_content
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -822,11 +860,13 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         elif total_length < 50000:
             CHUNK_LIMIT = 12000
         else:
-            CHUNK_LIMIT = 10000
+            CHUNK_LIMIT = 15000  # Increased to reduce number of chunks
     
     if total_length <= CHUNK_LIMIT:
         result = translate_chunk_with_fallback(content, primary_keyword, secondary_keywords)
         if result:
+            # Sanitize HTML to remove emojis / unnecessary spans
+            result['translated_html'] = clean_html_output(result['translated_html'])
             st.session_state[cache_key] = result
         return result
     else:
@@ -935,7 +975,7 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                 status_text.text("All chunks successfully translated after retry!")
         else:
             status_text.text("Translation complete!")
-        combined_html = "".join(translated_chunks)
+        combined_html = clean_html_output("".join(translated_chunks))
         final_result = {
             'translated_html': combined_html,
             'titles': seo_elements['titles'],
