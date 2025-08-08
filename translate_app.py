@@ -7,6 +7,15 @@ import time
 import requests
 import hashlib
 from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+ 
+# Try to load environment variables from a .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # Non-fatal: we'll rely on OS environment; provide an info message once
+    st.info("python-dotenv not installed — reading environment only from OS. To use a .env file, install python-dotenv.")
 
 # ----------------------
 # Utility: Clean HTML output
@@ -61,7 +70,10 @@ def init_openrouter_client():
     """Initialize OpenRouter connection parameters"""
     api_key = os.getenv('OPENROUTER_API_KEY')
     if not api_key:
-        raise ValueError("OpenRouter API key not found")
+        raise ValueError(
+            "OpenRouter API key not found. Set OPENROUTER_API_KEY in your environment or .env file. "
+            "Example .env:\nOPENROUTER_API_KEY=your_key_here\nOPENROUTER_MODEL=google/gemini-2.5-pro-preview"
+        )
     
     # Get model from environment variable or use default
     model = os.getenv('OPENROUTER_MODEL', "google/gemini-2.5-pro-preview")
@@ -754,44 +766,6 @@ def smart_chunk_html(html_content: str, max_length: int) -> list:
     
     soup = BeautifulSoup(html_content, "html.parser")
     container = soup.body if soup.body else soup
-    section_tags = ['section', 'article', 'div', 'main', 'header', 'footer', 'nav']
-    
-    major_sections = []
-    for tag_name in section_tags:
-        sections = container.find_all(tag_name, recursive=False)
-        if sections and len(sections) > 1:
-            major_sections = sections
-            break
-    
-    if major_sections:
-        chunks = []
-        current_chunk = StringIO()
-        current_size = 0
-        
-        for section in major_sections:
-            section_str = str(section)
-            section_len = len(section_str)
-            
-            if section_len > max_length:
-                if current_size > 0:
-                    chunks.append(current_chunk.getvalue())
-                    current_chunk = StringIO()
-                    current_size = 0
-                sub_chunks = smart_chunk_html(section_str, max_length)
-                chunks.extend(sub_chunks)
-            elif current_size + section_len > max_length and current_size > 0:
-                chunks.append(current_chunk.getvalue())
-                current_chunk = StringIO()
-                current_chunk.write(section_str)
-                current_size = section_len
-            else:
-                current_chunk.write(section_str)
-                current_size += section_len
-        
-        if current_size > 0:
-            chunks.append(current_chunk.getvalue())
-        
-        return chunks
 
     chunks = []
     current_chunk = StringIO()
@@ -826,7 +800,7 @@ def smart_chunk_html(html_content: str, max_length: int) -> list:
     
     return chunks
 
-def translate_content(content: str, primary_keyword: str = "", secondary_keywords: list = None) -> dict:
+def translate_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, max_workers: int = 1) -> dict:
     """
     Translate HTML content. If content is too long, split it into chunks,
     translate each using fallback logic, and combine results.
@@ -879,7 +853,7 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         progress_bar = st.progress(0)
         status_text = st.empty()
         status_text.text(f"Translating {actual_chunks} chunks...")
-        translated_chunks = []
+        translated_chunks = [None] * actual_chunks
         seo_elements = {
             'titles': [],
             'meta_descriptions': [],
@@ -888,33 +862,44 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         }
         primary_keyword_inserted = False
         failed_chunks = []
-        for i, chunk in enumerate(chunks):
-            progress = i / actual_chunks
-            progress_bar.progress(progress)
-            status_text.text(f"Translating chunk {i+1}/{actual_chunks}...")
-            
-            # For the first chunk, include primary keyword. For others, just secondary keywords
+
+        # Parallel translation of chunks
+        completed = 0
+        def submit_task(i, chunk):
+            # Determine primary keyword for the first chunk only
             chunk_primary = ""
             if primary_keyword and not primary_keyword_inserted and i == 0:
+                # Note: we don't modify primary_keyword_inserted here to avoid race; we just apply it to i==0
                 chunk_primary = primary_keyword
-                primary_keyword_inserted = True
-            
-            result = translate_chunk_with_fallback(chunk, chunk_primary, secondary_keywords)
-            if result is None:
-                failed_chunks.append(i)
-                continue
-            translated_chunks.append(result['translated_html'])
-            if result['titles'] and any(title.strip() for title in result['titles']):
-                seo_elements['titles'].extend(result['titles'])
-            if result['meta_descriptions'] and any(desc.strip() for desc in result['meta_descriptions']):
-                seo_elements['meta_descriptions'].extend(result['meta_descriptions'])
-            if result['alt_text'] and result['alt_text'].strip():
-                if not seo_elements['alt_text']:
-                    seo_elements['alt_text'] = result['alt_text']
-            if result.get('wordpress_slug', '') and result.get('wordpress_slug', '').strip():
-                if not seo_elements['wordpress_slug']:
-                    seo_elements['wordpress_slug'] = result.get('wordpress_slug', '')
-            time.sleep(1)
+            return _translate_single(chunk, chunk_primary, secondary_keywords)
+
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+            future_map = {executor.submit(submit_task, i, chunk): i for i, chunk in enumerate(chunks)}
+            for future in as_completed(future_map):
+                i = future_map[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = None
+                    st.error(f"Chunk {i+1} failed with exception: {e}")
+                if result is None:
+                    failed_chunks.append(i)
+                else:
+                    translated_chunks[i] = result['translated_html']
+                    if result['titles'] and any(title.strip() for title in result['titles']):
+                        seo_elements['titles'].extend(result['titles'])
+                    if result['meta_descriptions'] and any(desc.strip() for desc in result['meta_descriptions']):
+                        seo_elements['meta_descriptions'].extend(result['meta_descriptions'])
+                    if result['alt_text'] and result['alt_text'].strip():
+                        if not seo_elements['alt_text']:
+                            seo_elements['alt_text'] = result['alt_text']
+                    if result.get('wordpress_slug', '') and result.get('wordpress_slug', '').strip():
+                        if not seo_elements['wordpress_slug']:
+                            seo_elements['wordpress_slug'] = result.get('wordpress_slug', '')
+                completed += 1
+                progress_bar.progress(completed / actual_chunks)
+                status_text.text(f"Translated {completed}/{actual_chunks} chunks...")
+
         progress_bar.progress(1.0)
         # Add retry logic for failed chunks with simplified parameters
         if failed_chunks:
@@ -924,14 +909,12 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                 # Try again with no keywords and simplified mode for problematic chunks
                 retry_result = _translate_single(chunks[chunk_idx], "", [], max_retries=2, simplified_mode=True)
                 if retry_result is not None:
-                    # Insert at the correct position to maintain order
-                    translated_chunks.insert(chunk_idx, retry_result['translated_html'])
+                    translated_chunks[chunk_idx] = retry_result['translated_html']
                     retried_chunks.append(chunk_idx)
                     # Update progress
-                    progress = (i + 1 + len(retried_chunks)) / actual_chunks
+                    progress = (completed + len(retried_chunks)) / actual_chunks
                     progress_bar.progress(progress)
                     status_text.text(f"Recovered chunk {chunk_idx+1}")
-                    time.sleep(1)
             
             # Update failed chunks list
             remaining_failed = [idx for idx in failed_chunks if idx not in retried_chunks]
@@ -958,7 +941,7 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                     
                     if all_micro_successful:
                         # All micro-chunks translated successfully
-                        translated_chunks.insert(chunk_idx, "".join(micro_translated))
+                        translated_chunks[chunk_idx] = "".join(micro_translated)
                         status_text.text(f"Recovered chunk {chunk_idx+1} using micro-chunking")
                     else:
                         still_failed.append(chunk_idx)
@@ -975,7 +958,8 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                 status_text.text("All chunks successfully translated after retry!")
         else:
             status_text.text("Translation complete!")
-        combined_html = clean_html_output("".join(translated_chunks))
+        # Ensure order and drop any Nones before join (failed ones would have been retried)
+        combined_html = clean_html_output("".join([c for c in translated_chunks if isinstance(c, str)]))
         final_result = {
             'translated_html': combined_html,
             'titles': seo_elements['titles'],
@@ -1038,6 +1022,7 @@ if keywords:
 with st.expander("Advanced Options"):
     st.info("These settings help optimize translation of very large documents.")
     save_intermediate = st.checkbox("Save intermediate results (recommended for large files)", value=True)
+    concurrency = st.slider("Parallel requests (higher is faster but may hit rate limits)", min_value=1, max_value=8, value=3)
     clear_cache = st.button("Clear cache")
     
     if clear_cache:
@@ -1059,7 +1044,7 @@ if st.button("Translate"):
         start_time = time.time()
         with st.spinner("Analyzing document..."):
             try:
-                result = translate_content(html_input, primary_keyword, secondary_keywords)
+                result = translate_content(html_input, primary_keyword, secondary_keywords, max_workers=concurrency)
             except Exception as e:
                 st.error(f"Translation failed: {str(e)}")
                 result = None
@@ -1069,6 +1054,38 @@ if st.button("Translate"):
 
             if result:
                 st.success(f"Translation complete in {process_time:.1f} seconds!")
+                # Output vs Input comparison (rows/lines, characters, and HTML tags)
+                out_html = result['translated_html']
+                out_line_count = out_html.count('\n') + 1
+                out_char_count = len(out_html)
+                out_tag_count = len(re.findall(r'<[^>]+>', out_html))
+
+                # Avoid division by zero
+                line_ratio = (out_line_count / line_count) if line_count else 1.0
+                char_ratio = (out_char_count / char_count) if char_count else 1.0
+                tag_ratio = (out_tag_count / tag_count) if tag_count else 1.0
+
+                st.info(
+                    f"Output stats: {out_line_count} lines, {out_char_count} characters, approximately {out_tag_count} HTML tags\n"
+                    f"Ratios vs input → Lines: {line_ratio:.2f}×, Chars: {char_ratio:.2f}×, Tags: {tag_ratio:.2f}×"
+                )
+
+                # Shortcode and structure checks
+                shortcode_pattern = r"\[[^\[\]]+\]"
+                in_shortcodes = re.findall(shortcode_pattern, html_input)
+                out_shortcodes = re.findall(shortcode_pattern, out_html)
+                if in_shortcodes:
+                    st.info(f"Shortcodes: input {len(in_shortcodes)} → output {len(out_shortcodes)}")
+                    if len(out_shortcodes) < len(in_shortcodes):
+                        st.warning("⚠️ Some shortcodes may be missing in the output.")
+
+                # Warn if output appears significantly shorter than input
+                # Use chars/tags as stronger signal than lines (which can change due to formatting)
+                if (char_ratio < 0.90) or (tag_ratio < 0.90):
+                    st.warning(
+                        "⚠️ The translated output is significantly smaller by characters or tag count. "
+                        "This could indicate content omission by the model."
+                    )
                 
                 history_entry = {
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
