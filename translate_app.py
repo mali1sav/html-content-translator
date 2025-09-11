@@ -378,20 +378,25 @@ Content to translate:
 
 9. VERY IMPORTANT: This is chunk of a larger HTML document. Translate ONLY what's provided. Don't try to complete or start tags that seem incomplete - they will be joined with other chunks.
 
-Return exactly a valid JSON object matching the following schema without any additional text:
-{{
-  "translated_html": "STRING",
-  "titles": ["STRING"],
-  "meta_descriptions": ["STRING"],
-  "alt_text": "STRING",
-  "wordpress_slug": "STRING"
-}}
+       Return exactly a valid JSON object matching the following schema without any additional text:
+       {{
+         "translated_html": "STRING",
+         "titles": ["STRING"],
+         "meta_descriptions": ["STRING"],
+         "alt_text": "STRING",
+         "wordpress_slug": "STRING"
+       }}
 
-For meta_descriptions, create 3 distinct meta descriptions that:
-- Each contains the primary keyword once
-- Each contains 2-3 different secondary keywords
-- Are between 150-160 characters in length
-- Have different sentence structures and focuses
+       Title best practices (apply these when creating titles and provide 3 Thai title options in the "titles" array):
+       - Place the primary keyword at or near the beginning for stronger relevance
+       - Keep length concise (about 50–60 Thai characters) to avoid truncation
+       - Use a number or the year 2025 when it feels natural to boost CTR
+
+       For meta_descriptions, create 3 distinct meta descriptions that:
+       - Each contains the primary keyword once
+       - Each contains 2-3 different secondary keywords
+       - Are between 150-160 characters in length
+       - Have different sentence structures and focuses
 
 The wordpress_slug should be an English-language URL-friendly version that:
 - Closely matches high-volume search terms in your market
