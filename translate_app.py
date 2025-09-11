@@ -355,7 +355,7 @@ Content to translate:
    Do not alter any other URLs or domains besides these five. All other links must remain exactly as they are in the original HTML.
 
 6. Ensure Proper Spacing and Punctuation
-   Translate the visible text content to Thai while strictly following Thai orthographic and typographic conventions. Make sure no extra spaces or punctuation errors are introduced. Insert appropriate spacing where needed between Thai and any English words or technical terms. If there are English words in Thai sentences, ensure they are written in title case. For example: Exchange แบบ Non-Custodial ผู้ใช้จะได้รับ Private Keys ของตน. 
+   Translate the visible text content to Thai. Follow Thai ontological structure flow (entity then action/event and then outcome) with direct, active phrasing, and avoid using - to connect sentences (. Make sure no extra spaces or punctuation errors are introduced. Insert appropriate spacing where needed between Thai and any English words or technical terms. If there are English words in Thai sentences, ensure they are written in title case. For example: Exchange แบบ Non-Custodial ผู้ใช้จะได้รับ Private Keys ของตน. 
 
    Avoid word-for-word translation. You must ensure the sentence is correct and resonates with Thai Crypto readers. If needed, you can adjust the position of HTML tags to allow for active (direct) sentence structures rather than passive ones that may originate from the original language sentences.
 
