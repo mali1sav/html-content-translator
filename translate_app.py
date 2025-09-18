@@ -38,16 +38,14 @@ def clean_html_output(html_content: str) -> str:
                 if any('emoji' in c for c in classes):
                     img.decompose()
 
-            # 2. Unwrap <span> that only force font weight styling (Word docs etc.)
+            # 2. Strip out span wrappers from copy-pasted editor output while keeping inner text
             for span in soup.find_all('span'):
-                style = span.get('style', '') or ''
-                if 'font-weight' in style:
-                    span.unwrap()
+                span.unwrap()
 
             cleaned = str(soup)
         # Regex fallbacks / extra cleaning
         cleaned = re.sub(r'<img[^>]*class="emoji"[^>]*>', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'<span[^>]*font-weight:[^>]*>(.*?)</span>', r'\1', cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r'</?span[^>]*>', '', cleaned, flags=re.IGNORECASE)
         # Collapse multiple new-lines
         cleaned = re.sub(r'\n+', '\n', cleaned)
         return cleaned
@@ -305,6 +303,78 @@ def _validate_translation_result(result):
     
     return True
 
+
+def _prepend_keyword(text: str, keyword: str) -> str:
+    """Ensure keyword appears at the beginning of the provided text."""
+    if not keyword:
+        return text
+    if not text or not text.strip():
+        return keyword
+    if keyword.lower() in text.lower():
+        return text
+    return f"{keyword} {text}".strip()
+
+
+def _inject_keyword_into_html(html_content: str, keyword: str) -> str:
+    """Insert keyword into the first textual HTML container when missing."""
+    if not keyword:
+        return html_content
+    try:
+        pattern = re.compile(r'<(p|h[1-6]|span|li|td|th|div|section)[^>]*>', re.IGNORECASE)
+        match = pattern.search(html_content)
+        if match:
+            insert_pos = match.end()
+            return f"{html_content[:insert_pos]}{keyword} {html_content[insert_pos:]}"
+    except re.error:
+        pass
+    return f"{keyword} {html_content}".strip()
+
+
+def _enforce_primary_keyword_usage(result: dict, primary_keyword: str) -> dict:
+    """Guarantee that the primary keyword appears across key SEO fields."""
+    if not primary_keyword or not isinstance(result, dict):
+        return result
+
+    keyword_lower = primary_keyword.lower()
+
+    html_content = result.get('translated_html', '') or ''
+    if keyword_lower not in html_content.lower():
+        result['translated_html'] = _inject_keyword_into_html(html_content, primary_keyword)
+
+    titles = result.get('titles')
+    if isinstance(titles, list):
+        keyword_in_titles = any(isinstance(title, str) and keyword_lower in title.lower() for title in titles)
+        if not keyword_in_titles:
+            if titles:
+                titles[0] = _prepend_keyword(titles[0], primary_keyword)
+            else:
+                titles.append(primary_keyword)
+        result['titles'] = titles
+    elif titles is None:
+        result['titles'] = [primary_keyword]
+
+    meta_descriptions = result.get('meta_descriptions')
+    if isinstance(meta_descriptions, list) and meta_descriptions:
+        updated_meta = []
+        for desc in meta_descriptions:
+            if isinstance(desc, str) and desc.strip():
+                if keyword_lower in desc.lower():
+                    updated_meta.append(desc)
+                else:
+                    updated_meta.append(_prepend_keyword(desc, primary_keyword))
+            else:
+                updated_meta.append(primary_keyword)
+        result['meta_descriptions'] = updated_meta
+
+    alt_text = result.get('alt_text', '')
+    if isinstance(alt_text, str):
+        if not alt_text.strip():
+            result['alt_text'] = primary_keyword
+        elif keyword_lower not in alt_text.lower():
+            result['alt_text'] = _prepend_keyword(alt_text, primary_keyword)
+
+    return result
+
 def _translate_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False) -> dict:
     """Translate a single chunk of HTML content using Claude via OpenRouter with retries."""
     secondary_keywords = secondary_keywords or []
@@ -347,10 +417,10 @@ Content to translate:
    If you encounter *only* these specific links (with or without "/en" after the domain), change them to use "/th" instead:
 
    - `https://bestwallettoken.com` or `https://bestwallettoken.com/en` → `https://bestwallettoken.com/th`
-   - `https://mindofpepe.com` or `https://mindofpepe.com/en` → `https://mindofpepe.com/th`
-   - `https://solaxy.io` or `https://solaxy.io/en` → `https://solaxy.io/th`
-   - `https://memeindex.com` or `https://memeindex.com/en` → `https://memeindex.com/th`
-   - `https://btcbulltoken.com` or `https://btcbulltoken.com/en` → `https://btcbulltoken.com/th`
+   - `https://bitcoinhyper.com` or `https://bitcoinhyper.com/en` → `https://bitcoinhyper.com/th`
+   - `https://pepenode.io` or `https://pepenode.io/en` → `https://pepenode.io/th`
+   - `https://maxidogetoken.com/` or `https://maxidogetoken.com/en` → `https://maxidogetoken.com/th`
+   - `https://wallstreetpepe.com/` or `https://wallstreetpepe.com/en` → `https://wallstreetpepe.com/th`
 
    Do not alter any other URLs or domains besides these five. All other links must remain exactly as they are in the original HTML.
 
@@ -364,6 +434,7 @@ Content to translate:
 8. Keyword Integration:
    Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
    {f"Ensure that the primary keyword '{primary_keyword}' appears naturally in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x). Maintain original language (whether Thai or English or mix)." if primary_keyword else "No primary keyword provided."}
+   {"Use the primary keyword exactly as provided — do not replace it with transliterations, synonym spellings, or alternative terms." if primary_keyword else ""}
    
    Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
    {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the translated content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
@@ -846,6 +917,7 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         if result:
             # Sanitize HTML to remove emojis / unnecessary spans
             result['translated_html'] = clean_html_output(result['translated_html'])
+            result = _enforce_primary_keyword_usage(result, primary_keyword)
             st.session_state[cache_key] = result
         return result
     else:
@@ -902,7 +974,8 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                         if not seo_elements['wordpress_slug']:
                             seo_elements['wordpress_slug'] = result.get('wordpress_slug', '')
                 completed += 1
-                progress_bar.progress(completed / actual_chunks)
+                progress_value = completed / actual_chunks if actual_chunks else 0.0
+                progress_bar.progress(min(1.0, max(0.0, progress_value)))
                 status_text.text(f"Translated {completed}/{actual_chunks} chunks...")
 
         progress_bar.progress(1.0)
@@ -917,8 +990,8 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                     translated_chunks[chunk_idx] = retry_result['translated_html']
                     retried_chunks.append(chunk_idx)
                     # Update progress
-                    progress = (completed + len(retried_chunks)) / actual_chunks
-                    progress_bar.progress(progress)
+                    progress = (completed + len(retried_chunks)) / actual_chunks if actual_chunks else 1.0
+                    progress_bar.progress(min(1.0, max(0.0, progress)))
                     status_text.text(f"Recovered chunk {chunk_idx+1}")
             
             # Update failed chunks list
@@ -972,6 +1045,7 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
             'alt_text': seo_elements['alt_text'],
             'wordpress_slug': seo_elements['wordpress_slug']
         }
+        final_result = _enforce_primary_keyword_usage(final_result, primary_keyword)
         st.session_state[cache_key] = final_result
         return final_result
 
