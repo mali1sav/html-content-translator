@@ -70,7 +70,7 @@ def init_openrouter_client():
     if not api_key:
         raise ValueError(
             "OpenRouter API key not found. Set OPENROUTER_API_KEY in your environment or .env file. "
-            "Example .env:\nOPENROUTER_API_KEY=your_key_here\nOPENROUTER_MODEL=google/gemini-2.5-pro-preview"
+            "Example .env:\nOPENROUTER_API_KEY=your_key_here\nOPENROUTER_MODEL=google/gemini-2.5-flash"
         )
     
     # Get model from environment variable or use default
