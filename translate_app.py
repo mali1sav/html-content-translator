@@ -74,7 +74,7 @@ def init_openrouter_client():
         )
     
     # Get model from environment variable or use default
-    model = os.getenv('OPENROUTER_MODEL', "google/gemini-2.5-pro-preview")
+    model = os.getenv('OPENROUTER_MODEL', "google/gemini-2.5-flash")
     
     return {
         'api_key': api_key,
