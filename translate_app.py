@@ -293,7 +293,6 @@ def update_session_state_with_post_data(post_data):
         content_html = re.sub(pattern, '', content_html, flags=re.IGNORECASE)
     
     st.session_state['html_input'] = content_html
-    st.session_state['input_method_selector'] = "WordPress Fetch"
     st.session_state['wp_slug'] = post_data.get('slug', "")
 
     # 2. SEO Metadata (Yoast)
