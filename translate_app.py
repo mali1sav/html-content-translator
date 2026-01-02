@@ -1324,50 +1324,9 @@ elif step == 'translated':
 elif step == 'published':
     st.success("🚀 **Status: Published** - The draft has been created on the Thai site.")
 
-# --- 2. WordPress Automation Section ---
-# Only show or expand if we are in initial stages
-fetch_expanded = st.session_state['workflow_step'] in ['idle', 'fetched']
-with st.expander("WordPress Automation", expanded=fetch_expanded):
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        wp_url_input = st.text_input("Paste English Post/Page URL:", placeholder="https://cryptodnes.bg/en/terms-of-use/", key="wp_url_input")
-    with col2:
-        wp_id_input = st.text_input("OR Post ID:", placeholder="187200", key="wp_id_input")
-        
-    if st.button("Fetch Content from WordPress"):
-        if not wp_url_input and not wp_id_input:
-            st.error("Please enter a URL or Post ID")
-        else:
-            with st.spinner("Fetching post data..."):
-                # Clear results but keep previous history
-                st.session_state['translation_result'] = None
-                st.session_state['publish_result'] = None
-                st.session_state['publish_error'] = None
-                st.session_state['last_success'] = None
-                st.session_state['last_error'] = None
-                
-                # Try to extract ID
-                extracted_id = wp_id_input
-                if not extracted_id and wp_url_input and 'post=' in wp_url_input:
-                    try:
-                        extracted_id = re.search(r'post=(\d+)', wp_url_input).group(1)
-                    except: pass
-                
-                try:
-                    post_data = fetch_wp_post_by_url(wp_url_input, post_id=extracted_id)
-                    if post_data:
-                        title_text = update_session_state_with_post_data(post_data)
-                        st.session_state['workflow_step'] = 'fetched'
-                        st.session_state['last_success'] = f"Fetched: {title_text}"
-                        st.rerun()
-                except Exception as e:
-                    st.session_state['last_error'] = str(e)
-                    st.rerun()
-
-# --- 3. Input Selection Section ---
-# Use session state to track the radio choice to avoid bouncing
+# --- 2. Input Selection Section ---
 if 'input_method_selector' not in st.session_state:
-    st.session_state['input_method_selector'] = "WordPress Fetch" if st.session_state['workflow_step'] in ['fetched', 'translated', 'published'] else "Text Input"
+    st.session_state['input_method_selector'] = "Text Input"
 
 upload_method = st.radio(
     "Choose input method:", 
@@ -1377,6 +1336,45 @@ upload_method = st.radio(
 html_input = ""
 
 if upload_method == "WordPress Fetch":
+    # Show WordPress Automation inside here
+    fetch_expanded = st.session_state['workflow_step'] in ['idle', 'fetched']
+    with st.expander("WordPress Automation", expanded=fetch_expanded):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            wp_url_input = st.text_input("Paste English Post/Page URL:", value="https://cryptodnes.bg/en/terms-of-use/", key="wp_url_input")
+        with col2:
+            wp_id_input = st.text_input("OR Post ID:", placeholder="187200", key="wp_id_input")
+            
+        if st.button("Fetch Content from WordPress"):
+            if not wp_url_input and not wp_id_input:
+                st.error("Please enter a URL or Post ID")
+            else:
+                with st.spinner("Fetching post data..."):
+                    # Clear results but keep previous history
+                    st.session_state['translation_result'] = None
+                    st.session_state['publish_result'] = None
+                    st.session_state['publish_error'] = None
+                    st.session_state['last_success'] = None
+                    st.session_state['last_error'] = None
+                    
+                    # Try to extract ID
+                    extracted_id = wp_id_input
+                    if not extracted_id and wp_url_input and 'post=' in wp_url_input:
+                        try:
+                            extracted_id = re.search(r'post=(\d+)', wp_url_input).group(1)
+                        except: pass
+                    
+                    try:
+                        post_data = fetch_wp_post_by_url(wp_url_input, post_id=extracted_id)
+                        if post_data:
+                            title_text = update_session_state_with_post_data(post_data)
+                            st.session_state['workflow_step'] = 'fetched'
+                            st.session_state['last_success'] = f"Fetched: {title_text}"
+                            st.rerun()
+                    except Exception as e:
+                        st.session_state['last_error'] = str(e)
+                        st.rerun()
+
     if st.session_state['wp_post_data']:
         html_input = st.session_state['html_input']
         title_text = st.session_state['wp_post_data'].get('title', {}).get('rendered', 'Untitled')
