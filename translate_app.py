@@ -1495,6 +1495,14 @@ if st.button("Translate"):
 
             if result:
                 st.success(f"Translation complete in {process_time:.1f} seconds!")
+                
+                # Store translation result in session state for publish button access
+                st.session_state['translation_result'] = result
+                st.session_state['translation_html_input'] = html_input
+                st.session_state['translation_primary_keyword'] = primary_keyword
+                st.session_state['translation_secondary_keywords'] = secondary_keywords
+                st.session_state['translation_process_time'] = process_time
+                
                 # Output vs Input comparison (rows/lines, characters, and HTML tags)
                 out_html = result['translated_html']
                 
@@ -1539,111 +1547,6 @@ if st.button("Translate"):
                         "⚠️ The translated output has significantly fewer HTML tags than the input. "
                         "This could indicate content omission by the model."
                     )
-                
-                # WordPress Publishing Section
-                if 'wp_post_data' in st.session_state:
-                    st.divider()
-                    st.subheader("WordPress Publishing (Draft)")
-                    
-                    # Category Syncing
-                    en_categories = []
-                    en_tags = []
-                    if '_embedded' in st.session_state['wp_post_data'] and 'wp:term' in st.session_state['wp_post_data']['_embedded']:
-                        # wp:term is a list of lists, usually index 0 is categories, index 1 is tags
-                        for term_list in st.session_state['wp_post_data']['_embedded']['wp:term']:
-                            for term in term_list:
-                                if term.get('taxonomy') == 'category':
-                                    en_categories.append(term['name'])
-                                elif term.get('taxonomy') == 'post_tag':
-                                    en_tags.append(term['name'])
-                    
-                    if en_categories:
-                        st.info(f"Categories to sync: {', '.join(en_categories)}")
-                    if en_tags:
-                        st.info(f"Tags to sync: {', '.join(en_tags)}")
-                    
-                    # Featured Image Syncing
-                    en_featured_media_url = ""
-                    if '_embedded' in st.session_state['wp_post_data'] and 'wp:featuredmedia' in st.session_state['wp_post_data']['_embedded']:
-                        media = st.session_state['wp_post_data']['_embedded']['wp:featuredmedia'][0]
-                        en_featured_media_url = media.get('source_url', "")
-                    
-                    if en_featured_media_url:
-                        st.info(f"Featured image found: {en_featured_media_url}")
-                        st.image(en_featured_media_url, width=200)
-
-                    if st.button("Publish Draft to cryptodnes.bg/th"):
-                        with st.spinner("Syncing categories, tags and media..."):
-                            # 1. Sync Categories
-                            th_category_ids = []
-                            for cat_name in en_categories:
-                                cat_id = get_or_create_th_category(cat_name)
-                                if cat_id:
-                                    th_category_ids.append(cat_id)
-                            
-                            # 2. Sync Tags
-                            th_tag_ids = []
-                            for tag_name in en_tags:
-                                tag_id = get_or_create_th_tag(tag_name)
-                                if tag_id:
-                                    th_tag_ids.append(tag_id)
-                            
-                            # 3. Sync Featured Media
-                            th_media_id = None
-                            if en_featured_media_url:
-                                th_media_id = upload_media_to_wp_th(en_featured_media_url, title=result['titles'][0])
-                            
-                            # 4. Publish
-                            # Ensure we use the original English slug as requested
-                            if 'wp_slug' in st.session_state:
-                                result['wordpress_slug'] = st.session_state['wp_slug']
-                            
-                            # Determine post type and format from fetched data
-                            source_type = st.session_state['wp_post_data'].get('type', 'post')
-                            source_format = st.session_state['wp_post_data'].get('format', 'standard')
-                                
-                            pub_result = publish_to_wp_th(
-                                result, 
-                                categories=th_category_ids,
-                                tags=th_tag_ids,
-                                featured_media_id=th_media_id,
-                                post_type=source_type,
-                                format=source_format
-                            )
-                            
-                            # Store result in session state to persist after rerun
-                            st.session_state['publish_result'] = pub_result
-                            st.session_state['publish_error'] = None
-                            st.rerun()
-                    
-                    # Display publish result from session state
-                    if 'publish_result' in st.session_state and st.session_state['publish_result']:
-                        pub_result = st.session_state['publish_result']
-                        st.success("✅ Successfully published as draft!")
-                        st.balloons()
-                        
-                        # Show draft ID and construct edit URL
-                        draft_id = pub_result.get('id')
-                        draft_link = pub_result.get('link', '')
-                        
-                        st.markdown("### Draft Published")
-                        st.markdown(f"**Draft ID:** {draft_id}")
-                        st.markdown(f"**Public Link:** [{draft_link}]({draft_link})")
-                        
-                        # Construct WordPress admin edit URL
-                        config = get_wp_config()
-                        edit_url = f"{config['url']}/wp-admin/post.php?post={draft_id}&action=edit"
-                        st.markdown(f"**📝 Edit in WordPress:** [{edit_url}]({edit_url})")
-                        
-                        # Also show REST API link for reference
-                        if 'edit' in pub_result.get('_links', {}):
-                            api_link = pub_result['_links']['self'][0]['href']
-                            with st.expander("REST API Link"):
-                                st.code(api_link)
-                    
-                    # Display publish error from session state
-                    if 'publish_error' in st.session_state and st.session_state['publish_error']:
-                        st.error(f"❌ Failed to publish draft: {st.session_state['publish_error']}")
                 
                 history_entry = {
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1756,6 +1659,116 @@ if st.button("Translate"):
                         st.success(f"🎯 All keywords successfully integrated in the translation!")
                     else:
                         st.info(f"Keyword coverage: {coverage:.1f}% ({len(secondary_keywords) - len(missing_keywords)}/{len(secondary_keywords)} keywords)")
+
+# WordPress Publishing Section - Displayed when translation result exists in session state
+if 'translation_result' in st.session_state and st.session_state['translation_result']:
+    result = st.session_state['translation_result']
+    html_input = st.session_state.get('translation_html_input', '')
+    primary_keyword = st.session_state.get('translation_primary_keyword', '')
+    secondary_keywords = st.session_state.get('translation_secondary_keywords', [])
+    
+    if 'wp_post_data' in st.session_state:
+        st.divider()
+        st.subheader("WordPress Publishing (Draft)")
+        
+        # Category Syncing
+        en_categories = []
+        en_tags = []
+        if '_embedded' in st.session_state['wp_post_data'] and 'wp:term' in st.session_state['wp_post_data']['_embedded']:
+            for term_list in st.session_state['wp_post_data']['_embedded']['wp:term']:
+                for term in term_list:
+                    if term.get('taxonomy') == 'category':
+                        en_categories.append(term['name'])
+                    elif term.get('taxonomy') == 'post_tag':
+                        en_tags.append(term['name'])
+        
+        if en_categories:
+            st.info(f"Categories to sync: {', '.join(en_categories)}")
+        if en_tags:
+            st.info(f"Tags to sync: {', '.join(en_tags)}")
+        
+        # Featured Image Syncing
+        en_featured_media_url = ""
+        if '_embedded' in st.session_state['wp_post_data'] and 'wp:featuredmedia' in st.session_state['wp_post_data']['_embedded']:
+            media = st.session_state['wp_post_data']['_embedded']['wp:featuredmedia'][0]
+            en_featured_media_url = media.get('source_url', "")
+        
+        if en_featured_media_url:
+            st.info(f"Featured image found: {en_featured_media_url}")
+            st.image(en_featured_media_url, width=200)
+
+        if st.button("Publish Draft to cryptodnes.bg/th"):
+            with st.spinner("Syncing categories, tags and media..."):
+                # 1. Sync Categories
+                th_category_ids = []
+                for cat_name in en_categories:
+                    cat_id = get_or_create_th_category(cat_name)
+                    if cat_id:
+                        th_category_ids.append(cat_id)
+                
+                # 2. Sync Tags
+                th_tag_ids = []
+                for tag_name in en_tags:
+                    tag_id = get_or_create_th_tag(tag_name)
+                    if tag_id:
+                        th_tag_ids.append(tag_id)
+                
+                # 3. Sync Featured Media
+                th_media_id = None
+                if en_featured_media_url:
+                    th_media_id = upload_media_to_wp_th(en_featured_media_url, title=result['titles'][0])
+                
+                # 4. Publish
+                # Ensure we use the original English slug as requested
+                if 'wp_slug' in st.session_state:
+                    result['wordpress_slug'] = st.session_state['wp_slug']
+                
+                # Determine post type and format from fetched data
+                source_type = st.session_state['wp_post_data'].get('type', 'post')
+                source_format = st.session_state['wp_post_data'].get('format', 'standard')
+                    
+                pub_result = publish_to_wp_th(
+                    result, 
+                    categories=th_category_ids,
+                    tags=th_tag_ids,
+                    featured_media_id=th_media_id,
+                    post_type=source_type,
+                    format=source_format
+                )
+                
+                # Store result in session state to persist after rerun
+                st.session_state['publish_result'] = pub_result
+                st.session_state['publish_error'] = None
+                st.rerun()
+        
+        # Display publish result from session state
+        if 'publish_result' in st.session_state and st.session_state['publish_result']:
+            pub_result = st.session_state['publish_result']
+            st.success("✅ Successfully published as draft!")
+            st.balloons()
+            
+            # Show draft ID and construct edit URL
+            draft_id = pub_result.get('id')
+            draft_link = pub_result.get('link', '')
+            
+            st.markdown("### Draft Published")
+            st.markdown(f"**Draft ID:** {draft_id}")
+            st.markdown(f"**Public Link:** [{draft_link}]({draft_link})")
+            
+            # Construct WordPress admin edit URL
+            config = get_wp_config()
+            edit_url = f"{config['url']}/wp-admin/post.php?post={draft_id}&action=edit"
+            st.markdown(f"**📝 Edit in WordPress:** [{edit_url}]({edit_url})")
+            
+            # Also show REST API link for reference
+            if 'edit' in pub_result.get('_links', {}):
+                api_link = pub_result['_links']['self'][0]['href']
+                with st.expander("REST API Link"):
+                    st.code(api_link)
+        
+        # Display publish error from session state
+        if 'publish_error' in st.session_state and st.session_state['publish_error']:
+            st.error(f"❌ Failed to publish draft: {st.session_state['publish_error']}")
 
 with st.sidebar.expander("Translation History"):
     if not st.session_state['history']:
