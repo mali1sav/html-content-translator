@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import os
 import json
 import html
@@ -6,9 +7,33 @@ import re
 import time
 import requests
 import hashlib
+import base64
 from io import StringIO
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
- 
+
+# --- MUST BE FIRST STREAMLIT COMMAND ---
+st.set_page_config(
+    page_title="Crypto HTML Translator",
+    page_icon="🌐",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Initialize ALL session state keys
+if 'history' not in st.session_state: st.session_state['history'] = []
+if 'debug_log' not in st.session_state: st.session_state['debug_log'] = ""
+if 'html_input' not in st.session_state: st.session_state['html_input'] = ""
+if 'translation_result' not in st.session_state: st.session_state['translation_result'] = None
+if 'publish_result' not in st.session_state: st.session_state['publish_result'] = None
+if 'publish_error' not in st.session_state: st.session_state['publish_error'] = None
+if 'wp_post_data' not in st.session_state: st.session_state['wp_post_data'] = None
+if 'workflow_step' not in st.session_state: st.session_state['workflow_step'] = 'idle'
+if 'auto_keywords' not in st.session_state: st.session_state['auto_keywords'] = ""
+if 'wp_slug' not in st.session_state: st.session_state['wp_slug'] = ""
+if 'last_success' not in st.session_state: st.session_state['last_success'] = None
+if 'last_error' not in st.session_state: st.session_state['last_error'] = None
+
 # Try to load environment variables from a .env file if present
 try:
     from dotenv import load_dotenv
@@ -17,9 +42,348 @@ except ImportError:
     # Non-fatal: we'll rely on OS environment; provide an info message once
     st.info("python-dotenv not installed — reading environment only from OS. To use a .env file, install python-dotenv.")
 
+# Try to import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    st.warning("BeautifulSoup is not installed. Attempting to install beautifulsoup4...")
+    try:
+        import subprocess
+        import sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "beautifulsoup4"])
+        from bs4 import BeautifulSoup
+    except Exception:
+        st.error("Failed to install BeautifulSoup. Falling back to basic chunking.")
+        BeautifulSoup = None
+
+def create_slug(text: str) -> str:
+    """Create a URL-friendly slug from text."""
+    if not text:
+        return "default-slug"
+    slug = re.sub(r'[^\w\s-]', '', text.lower())
+    slug = re.sub(r'[\s-]+', '-', slug)
+    return slug.strip('-')
+
 # ----------------------
-# Utility: Clean HTML output
+# WordPress Configuration & Auth
 # ----------------------
+
+def get_wp_config(site='cryptodnes'):
+    """Retrieve WordPress configuration from environment variables."""
+    if site.lower() == 'icobench':
+        return {
+            'url': os.getenv('ICOBENCH_WP_URL', 'https://icobench.com/th/').rstrip('/'),
+            'username': os.getenv('ICOBENCH_WP_USERNAME'),
+            'app_password': os.getenv('ICOBENCH_WP_APP_PASSWORD')
+        }
+    else:  # Default to cryptodnes
+        return {
+            'url': os.getenv('CRYPTODNES_WP_URL', 'https://cryptodnes.bg/th/').rstrip('/'),
+            'username': os.getenv('CRYPTODNES_WP_USERNAME'),
+            'app_password': os.getenv('CRYPTODNES_WP_APP_PASSWORD')
+        }
+
+def get_wp_auth_header(site='cryptodnes'):
+    """Generate Basic Auth header for WordPress using env credentials."""
+    config = get_wp_config(site)
+    if not config['username'] or not config['app_password']:
+        return {}
+    credentials = f"{config['username']}:{config['app_password']}"
+    token = base64.b64encode(credentials.encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+def detect_site_from_url(url):
+    """Detect which WordPress site a URL belongs to."""
+    if 'icobench.com' in url:
+        return 'icobench'
+    elif 'cryptodnes.bg' in url:
+        return 'cryptodnes'
+    else:
+        return 'cryptodnes'  # Default fallback
+
+def fetch_wp_post_by_url(url, post_id=None):
+    """
+    Fetch WordPress post data by URL or Post ID using the REST API.
+    Returns the post data dict or raises an exception.
+    """
+    # Detect which site this URL belongs to
+    site = detect_site_from_url(url)
+    auth_header = get_wp_auth_header(site)
+    
+    parsed_url = urlparse(url)
+    domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    
+    path_parts = parsed_url.path.strip('/').split('/')
+    subdir = ""
+    if path_parts and len(path_parts[0]) == 2:
+        subdir = f"/{path_parts[0]}"
+
+    if post_id:
+        try:
+            for api_base in [f"{domain}{subdir}", domain]:
+                api_root = f"{api_base}/wp-json"
+                for ep in ["posts", "pages"]:
+                    api_url = f"{api_root}/wp/v2/{ep}/{post_id}?_embed"
+                    try:
+                        response = requests.get(api_url, headers=auth_header, timeout=15)
+                        if response.status_code == 200:
+                            data = response.json()
+                            if isinstance(data, dict) and 'title' in data:
+                                return data
+                    except:
+                        continue
+        except Exception as e:
+            # We don't necessarily want to stop here as we can try URL discovery next
+            pass
+
+    try:
+        # Step 1: Try to get the REST API link from the page headers
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        headers.update(auth_header)
+        
+        # We need to get the response to check headers AND potentially the body for the API link
+        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            # Fallback to slug search later if direct load fails
+            pass
+        else:
+            api_link = resp.headers.get('Link')
+            
+            post_api_url = None
+            if api_link:
+                match = re.search(r'<([^>]+)>;\s*rel="https://api.w.org/"', api_link)
+                if not match:
+                    match = re.search(r'<([^>]+)>;\s*rel="alternate";\s*type="application/json"', api_link)
+                
+                if match:
+                    post_api_url = match.group(1)
+            
+            # If not in headers, check HTML for <link rel='https://api.w.org/' href='...' />
+            if not post_api_url:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                link_tag = soup.find('link', rel='https://api.w.org/')
+                if link_tag:
+                    post_api_url = link_tag.get('href')
+
+            # Step 2: If we found a direct API URL, use it
+            if post_api_url:
+                if '?' in post_api_url:
+                    api_url = post_api_url + "&_embed"
+                else:
+                    api_url = post_api_url + "?_embed"
+                
+                response = requests.get(api_url, headers=headers, timeout=15)
+                if response.status_code == 200:
+                    data = response.json()
+                    # Handle list response (e.g. if the link was to a collection)
+                    if isinstance(data, list) and len(data) > 0:
+                        data = data[0]
+                    
+                    if isinstance(data, dict) and 'title' in data:
+                        return data
+
+        # Step 3: Slug search fallback
+        slug = path_parts[-1] if path_parts else ""
+        if not slug:
+            # Maybe the slug is the second to last part if URL ends with /
+            if len(path_parts) > 1 and not path_parts[-1]:
+                slug = path_parts[-2]
+        
+        if not slug:
+            raise ValueError("Could not determine slug from URL")
+
+        # Try these endpoints in order, with and without subdirectory
+        api_roots = [f"{domain}{subdir}/wp-json", f"{domain}/wp-json"]
+        endpoints = ["posts", "pages"]
+        
+        for api_root in api_roots:
+            for ep in endpoints:
+                search_url = f"{api_root}/wp/v2/{ep}?slug={slug}&_embed"
+                try:
+                    response = requests.get(search_url, headers=headers, timeout=15)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            if 'title' in data[0]:
+                                return data[0]
+                except Exception:
+                    continue
+
+        raise ValueError(f"Could not find valid post/page data for '{slug}' or direct ID at {domain}")
+
+    except Exception as e:
+        raise Exception(f"Error fetching WordPress post: {str(e)}")
+
+def publish_to_wp_th(content_data, categories=None, tags=None, featured_media_id=None, post_type="post", format="standard", site='cryptodnes'):
+    """
+    Publish the translated content to the Thai WordPress site as a draft.
+    Returns the response JSON or raises an exception.
+    """
+    config = get_wp_config(site)
+    if not config['username'] or not config['app_password']:
+        raise Exception(f"WordPress credentials missing in .env for {site}")
+
+    endpoint = "posts" if post_type == "post" else "pages"
+    api_url = f"{config['url']}/wp-json/wp/v2/{endpoint}"
+    auth_header = get_wp_auth_header(site)
+    
+    post_payload = {
+        "title": content_data.get('titles', [""])[0],
+        "content": content_data.get('translated_html', ""),
+        "excerpt": content_data.get('meta_descriptions', [""])[0] if content_data.get('meta_descriptions') else "",
+        "slug": content_data.get('wordpress_slug', ""),
+        "status": "draft",
+        "format": format
+    }
+    
+    if post_type == "post":
+        if categories: post_payload["categories"] = categories
+        if tags: post_payload["tags"] = tags
+        
+    if featured_media_id:
+        post_payload["featured_media"] = featured_media_id
+
+    response = requests.post(api_url, headers=auth_header, json=post_payload, timeout=20)
+    if response.status_code not in [200, 201]:
+        raise Exception(f"WP API Error: {response.text}")
+    return response.json()
+
+def get_or_create_th_term(term_name, taxonomy="category", site='cryptodnes'):
+    """
+    Find or create a term (category or tag) on the Thai site.
+    """
+    config = get_wp_config(site)
+    auth_header = get_wp_auth_header(site)
+    if not auth_header:
+        return None
+
+    # Map taxonomy to endpoint
+    endpoint = "categories" if taxonomy == "category" else "tags"
+    api_url = f"{config['url']}/wp-json/wp/v2/{endpoint}"
+    
+    try:
+        # Search for existing term
+        search_response = requests.get(f"{api_url}?search={re.escape(term_name)}", headers=auth_header, timeout=10)
+        search_response.raise_for_status()
+        terms = search_response.json()
+        
+        for term in terms:
+            if term['name'].lower() == term_name.lower():
+                return term['id']
+                
+        # If not found, create it
+        create_payload = {"name": term_name}
+        create_response = requests.post(api_url, headers=auth_header, json=create_payload, timeout=10)
+        create_response.raise_for_status()
+        return create_response.json()['id']
+        
+    except Exception as e:
+        # Silently fail for term sync, not critical enough to stop the workflow
+        return None
+
+def get_or_create_th_category(en_category_name, site='cryptodnes'):
+    return get_or_create_th_term(en_category_name, "category", site)
+
+def get_or_create_th_tag(en_tag_name, site='cryptodnes'):
+    return get_or_create_th_term(en_tag_name, "post_tag", site)
+
+def update_session_state_with_post_data(post_data):
+    """Update Streamlit session state with fetched WordPress post data."""
+    if not post_data:
+        return
+
+    # 1. Basic Info
+    title_text = post_data.get('title', {}).get('rendered', 'Untitled')
+    st.session_state['wp_post_data'] = post_data
+    
+    # Get content and remove TOC shortcodes to avoid duplication
+    content_html = post_data.get('content', {}).get('rendered', '')
+    # Remove common TOC shortcodes
+    toc_patterns = [
+        r'\[toc[^\]]*\]',
+        r'\[table_of_contents[^\]]*\]',
+        r'\[ez-toc[^\]]*\]',
+        r'\[toc_page[^\]]*\]'
+    ]
+    for pattern in toc_patterns:
+        content_html = re.sub(pattern, '', content_html, flags=re.IGNORECASE)
+    
+    st.session_state['html_input'] = content_html
+    st.session_state['wp_slug'] = post_data.get('slug', "")
+
+    # 2. SEO Metadata (Yoast)
+    meta_desc = ""
+    focus_kw = ""
+    if 'yoast_head_json' in post_data:
+        meta_desc = post_data['yoast_head_json'].get('description', "")
+        focus_kw = post_data['yoast_head_json'].get('focuskw', "")
+    
+    if not focus_kw and 'meta' in post_data:
+        focus_kw = post_data['meta'].get('_yoast_wpseo_focuskw', "")
+
+    st.session_state['wp_meta_desc'] = meta_desc
+
+    # 3. Tags & Keywords Automation
+    en_tags = []
+    if '_embedded' in post_data and 'wp:term' in post_data['_embedded']:
+        for term_list in post_data['_embedded']['wp:term']:
+            for term in term_list:
+                if term.get('taxonomy') == 'post_tag':
+                    en_tags.append(term['name'])
+    
+    kw_lines = []
+    if focus_kw:
+        kw_lines.append(focus_kw)
+    
+    for tag in en_tags:
+        if tag not in kw_lines:
+            kw_lines.append(tag)
+    
+    if kw_lines:
+        kws = "\n".join(kw_lines)
+        st.session_state['auto_keywords'] = kws
+    
+    return title_text
+
+
+def upload_media_to_wp_th(image_url, title="", site='cryptodnes'):
+    """
+    Download image from English site and upload to Thai site.
+    """
+    config = get_wp_config(site)
+    auth_header = get_wp_auth_header(site)
+    if not auth_header:
+        return None
+
+    api_url = f"{config['url']}/wp-json/wp/v2/media"
+    
+    try:
+        # 1. Download image
+        img_resp = requests.get(image_url, timeout=15)
+        img_resp.raise_for_status()
+        
+        # 2. Get filename from URL
+        filename = urlparse(image_url).path.split('/')[-1]
+        if not filename:
+            filename = "featured-image.jpg"
+            
+        # 3. Upload to Thai site
+        upload_headers = auth_header.copy()
+        upload_headers.update({
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Content-Type": img_resp.headers.get('Content-Type', 'image/jpeg')
+        })
+        
+        upload_resp = requests.post(api_url, headers=upload_headers, data=img_resp.content, timeout=30)
+        upload_resp.raise_for_status()
+        return upload_resp.json()['id']
+        
+    except Exception as e:
+        st.warning(f"Could not sync featured image: {str(e)}")
+        return None
+
 
 def clean_html_output(html_content: str) -> str:
     """Remove editor artefacts such as emoji <img> tags, redundant <span> wrappers and excessive new-lines.
@@ -52,33 +416,23 @@ def clean_html_output(html_content: str) -> str:
     except Exception:
         # In worst case, just return original
         return html_content
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    st.warning("BeautifulSoup is not installed. Installing a lightweight version...")
-    try:
-        import pip
-        pip.main(['install', 'beautifulsoup4'])
-        from bs4 import BeautifulSoup
-    except:
-        st.error("Failed to install BeautifulSoup. Falling back to basic chunking.")
-        BeautifulSoup = None
 
-def init_openrouter_client():
-    """Initialize OpenRouter connection parameters"""
+# ----------------------
+# OpenRouter Configuration
+# ----------------------
+
+def get_openrouter_config():
+    """Retrieve OpenRouter configuration from environment variables."""
     api_key = os.getenv('OPENROUTER_API_KEY')
     if not api_key:
         raise ValueError(
             "OpenRouter API key not found. Set OPENROUTER_API_KEY in your environment or .env file. "
-            "Example .env:\nOPENROUTER_API_KEY=your_key_here\nOPENROUTER_MODEL=google/gemini-2.5-flash"
+            "Example .env:\nOPENROUTER_API_KEY=your_key_here\nOPENROUTER_MODEL=z-ai/glm-4.7"
         )
-    
-    # Get model from environment variable or use default
-    model = os.getenv('OPENROUTER_MODEL', "google/gemini-2.5-flash")
     
     return {
         'api_key': api_key,
-        'default_model': model,
+        'default_model': os.getenv('OPENROUTER_MODEL', "z-ai/glm-4.7"),
         'api_url': "https://openrouter.ai/api/v1/chat/completions"
     }
 
@@ -87,10 +441,6 @@ def extract_json_safely(resp_text):
     Attempts to extract a JSON object from the response text.
     Returns the parsed JSON object or None if extraction fails.
     """
-    # Debug log the response (first 500 chars to avoid excessive length)
-    debug_text = resp_text[:500] + '...' if len(resp_text) > 500 else resp_text
-    st.session_state['debug_log'] = debug_text
-    
     # Method 1: Try direct JSON loading first
     try:
         # First, try to load the entire response as JSON
@@ -154,15 +504,13 @@ def extract_json_safely(resp_text):
                 if _validate_translation_result(parsed):
                     return parsed
                 else:
-                    st.warning("Method 2: Extracted JSON failed validation")
                     return None
-        except json.JSONDecodeError as e:
-            st.warning(f"Method 2 JSON parse error: {e}. Preview: {json_str[:200]}...")
+        except json.JSONDecodeError:
             # Don't continue to Method 3 if we had a JSON structure but it was malformed
             return None
 
-    except Exception as e:
-        st.warning(f"Method 2 error: {str(e)}")
+    except Exception:
+        pass
     
     # Method 3: Manual JSON construction from the response text (only if Method 2 didn't find JSON structure)
     try:
@@ -181,7 +529,6 @@ def extract_json_safely(resp_text):
             html_content = translated_html_match.group(1)
             # Check if the HTML content seems complete (not cut off mid-tag)
             if not _is_html_content_complete(html_content):
-                st.warning("Method 3: HTML content appears incomplete")
                 return None
                 
             result['translated_html'] = html.unescape(html_content)
@@ -220,11 +567,7 @@ def extract_json_safely(resp_text):
             else:
                 # Create a default slug if none is found
                 if result.get('titles') and result['titles']:
-                    from re import sub
-                    title = result['titles'][0]
-                    slug = sub(r'[^\w\s-]', '', title.lower())
-                    slug = sub(r'[\s-]+', '-', slug)
-                    result['wordpress_slug'] = slug
+                    result['wordpress_slug'] = create_slug(result['titles'][0])
                 else:
                     result['wordpress_slug'] = "default-slug"
             
@@ -232,14 +575,12 @@ def extract_json_safely(resp_text):
             if _validate_translation_result(result):
                 return result
             else:
-                st.warning("Method 3: Constructed result failed validation")
                 return None
                 
-    except Exception as e:
-        st.warning(f"Method 3 error: {str(e)}")
+    except Exception:
+        pass
     
-    # If all methods fail, log the response for debugging and return None
-    st.error(f"All extraction methods failed. First 300 chars of response: {resp_text[:300]}")
+    # If all methods fail, return None
     return None
 
 def _fix_json_html_attributes(json_str):
@@ -375,220 +716,121 @@ def _enforce_primary_keyword_usage(result: dict, primary_keyword: str) -> dict:
 
     return result
 
-def _translate_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False) -> dict:
+def _translate_single(text: str, primary_keyword: str = "", secondary_keywords: list = None, max_retries=3, simplified_mode=False, extra_context="") -> dict:
     """Translate a single chunk of HTML content using Claude via OpenRouter with retries."""
     secondary_keywords = secondary_keywords or []
     
-    if simplified_mode:
-        # Use a simpler prompt with fewer requirements for problematic chunks
-        prompt = f"""You are a Thai translator specializing in HTML content. Translate this HTML chunk to Thai following these critical requirements:
+    # Common core requirements for both modes
+    core_rules = """
+1. HTML Integrity: Keep all HTML tags, attributes, and inline styles completely unchanged.
+2. Technical Content: Preserve URLs, variables (e.g. {{var}}), and shortcodes (e.g. [toc]) exactly.
+3. Entities & Brands: Keep brand names, coin names, and technical entities in English (e.g., "Bitcoin").
+4. Technical Terms: Keep technical terms in English but explain them in easy-to-understand Thai where appropriate.
+5. JSON Output: Return ONLY a valid JSON object with this exact structure:
+{
+  "translated_html": "Thai content",
+  "titles": ["3 options"],
+  "meta_descriptions": ["3 options"],
+  "alt_text": "Thai alt text",
+  "wordpress_slug": "english-slug"
+}"""
 
-1. Never modify HTML tags or attributes - only translate visible text
-2. Keep all technical terms and brand names in English
-3. Preserve all URLs, variables, and code exactly as they are
-4. Return ONLY a valid JSON object with this exact structure:
-{{
-  "translated_html": "HTML content with Thai text",
-  "titles": ["Any title found"],
-  "meta_descriptions": ["Any meta description found"],
-  "alt_text": "Any alt text found",
-  "wordpress_slug": "english-version-of-title"
-}}
+    if simplified_mode:
+        prompt = f"""You are a Thai translator specializing in HTML content. Translate this HTML chunk to Thai following these rules:
+{core_rules}
+
+5. Only translate visible text.
+6. Return ONLY the JSON object, no extra text.
 
 Content to translate:
 {text}"""
     else:
-        # Use the full detailed prompt for normal translation
-        prompt = f"""You are a Senior Thai Crypto journalist specializing in translating technical crypto content. Translate HTML content to Thai by following these strict translation requirements:
+        # Detailed SEO and Journalistic requirements
+        prompt = f"""You are a Senior Thai Crypto journalist. Translate HTML content to Thai following these rules:
+{core_rules}
 
-1. Preserve HTML Structure
-   Keep all HTML tags, attributes, and inline styles completely unchanged. Do not modify the HTML in any way except to translate the visible text.
+5. Translate ALL Visible Texts: This includes headers, paragraphs, list items, table cells, and especially anchor text in links.
+6. URL Localization: Change ALL URLs containing /en/ to /th/ (e.g., https://cryptodnes.bg/en/terms-of-use/ → https://cryptodnes.bg/th/terms-of-use/).
+7. Specific Link Mapping: Also change these domains to /th variants: bestwallettoken.com, bitcoinhyper.com, pepenode.io, maxidogetoken.com, wallstreetpepe.com.
+8. Thai Ontological Flow: Use direct, active phrasing. Ensure proper spacing between Thai and English words.
+9. Keyword Integration:
+   - Primary Keyword: {primary_keyword if primary_keyword else "None"}
+   - Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None"}
+   - Ensure natural placement in titles, first paragraph, and headings.
 
-2. Retain Technical Content
-   Do not modify any technical elements such as URLs, placeholders (e.g., [cur_year], {{{{variable}}}}), and shortcodes (e.g., [su_note], [toc]). They must remain exactly as they are — except for the specific links detailed in point #5 below. Under no circumstances should any code, variable, or shortcode be altered.
+10. SEO Best Practices:
+   - Provide 3 Thai title options (50-60 characters).
+   - Provide 3 meta descriptions (150-160 characters) including keywords.
+   - For wordpress_slug: If an original slug is provided in the CONTEXT below, use it EXACTLY without any additions. Otherwise, create a concise English URL-friendly version (3-5 words).
 
-3. Maintain English Technical Terms, Entities, and Brands
-   Do not translate entity names, or brands. For example, always use "Bitcoin" (not a translated equivalent) and keep all other technical terms and entities in English. This includes cryptocurrency names, blockchain terms, etc. Keep Technical terms in English but explain it in the way that is easier to understand via Thai. For example "Market intelligence - ฟีเจอร์วิเคราะห์ตลาดที่ช่วยให้ข้อมูลเชิงลึกสำหรับการตัดสินใจทางการเงิน". However, if the source text or any provided keyword already uses a Thai transliteration (e.g., "บิทคอยน์"), preserve that exact Thai form and do not revert it back to English. Apply this especially to the primary and secondary keywords—they must appear exactly as provided even if that conflicts with the English-term guideline.
-
-4. Translate *ALL* Visible Texts.
-   You *must* translate *all* visible text into Thai *without exception*, unless it falls under rule #3 (technical terms/brands). This includes *everything* inside h2, h3, paragraphs, list items, table cells, button text, *and especially text within `<span>` and anchor text in hyperlink tags, no matter where they appear*. Double-check to ensure *every* piece of translatable text is translated into Thai. *There should be NO English or another language text remaining in the translation except for the exceptions outlined in rule #3.*
-
-5. Modify Only These Specific Links to the Thai Variant
-   If you encounter *only* these specific links (with or without "/en" after the domain), change them to use "/th" instead:
-
-   - `https://bestwallettoken.com` or `https://bestwallettoken.com/en` → `https://bestwallettoken.com/th`
-   - `https://bitcoinhyper.com` or `https://bitcoinhyper.com/en` → `https://bitcoinhyper.com/th`
-   - `https://pepenode.io` or `https://pepenode.io/en` → `https://pepenode.io/th`
-   - `https://maxidogetoken.com/` or `https://maxidogetoken.com/en` → `https://maxidogetoken.com/th`
-   - `https://wallstreetpepe.com/` or `https://wallstreetpepe.com/en` → `https://wallstreetpepe.com/th`
-
-   Do not alter any other URLs or domains besides these five. All other links must remain exactly as they are in the original HTML.
-
-6. Ensure Proper Spacing and Punctuation
-   Translate the visible text content to Thai. Follow Thai ontological structure flow (entity then action/event and then outcome) with direct, active phrasing, and avoid using - to connect sentences (. Make sure no extra spaces or punctuation errors are introduced. Insert appropriate spacing where needed between Thai and any English words or technical terms. If there are English words in Thai sentences, ensure they are written in title case. For example: Exchange แบบ Non-Custodial ผู้ใช้จะได้รับ Private Keys ของตน. 
-
-   Avoid word-for-word translation. You must ensure the sentence is correct and resonates with Thai Crypto readers. If needed, you can adjust the position of HTML tags to allow for active (direct) sentence structures rather than passive ones that may originate from the original language sentences.
-
-7. Do not add or remove wrapper tags (like <!DOCTYPE html>, <html>, <head>, or <body>) unless they already exist in the snippet.
-
-8. Keyword Integration:
-   Primary Keyword: {primary_keyword if primary_keyword else "None provided"}
-   {f"Ensure that the primary keyword '{primary_keyword}' appears naturally in Title (1x), First paragraph (1x), and Headings and remaining paragraphs where they fit naturally, Meta description (1x). Maintain original language (whether Thai or English or mix)." if primary_keyword else "No primary keyword provided."}
-   {"Use the primary keyword exactly as provided — do not replace it with transliterations, synonym spellings, or alternative terms." if primary_keyword else ""}
-   
-   Secondary Keywords: {', '.join(secondary_keywords) if secondary_keywords else "None provided"}
-   {f"IMPORTANT: You MUST include EACH secondary keyword at least once in the translated content. Place secondary keywords strategically in:" if secondary_keywords else "No secondary keywords provided."}
-   {f"   - At least 2-3 H2 or H3 headings" if secondary_keywords else ""}
-   {f"   - Within paragraphs where they fit naturally" if secondary_keywords else ""}
-   {f"   - In the FAQ section questions and answers (if present)" if secondary_keywords else ""}
-   
-   {f"Priority secondary keywords (include these first):" if secondary_keywords else ""}
-   {f"   {', '.join(secondary_keywords[:5]) if len(secondary_keywords) > 5 else ', '.join(secondary_keywords)}" if secondary_keywords else ""}
-   
-   {f"Limit each secondary keyword to maximum 2 mentions in the entire content." if secondary_keywords else ""}
-
-9. VERY IMPORTANT: This is chunk of a larger HTML document. Translate ONLY what's provided. Don't try to complete or start tags that seem incomplete - they will be joined with other chunks.
-
-       Return exactly a valid JSON object matching the following schema without any additional text:
-       {{
-         "translated_html": "STRING",
-         "titles": ["STRING"],
-         "meta_descriptions": ["STRING"],
-         "alt_text": "STRING",
-         "wordpress_slug": "STRING"
-       }}
-
-       Title best practices (apply these when creating titles and provide 3 Thai title options in the "titles" array):
-       - Place the primary keyword at or near the beginning for stronger relevance
-       - Keep length concise (about 50–60 Thai characters) to avoid truncation
-       - Use a number or the year 2025 when it feels natural to boost CTR
-
-       For meta_descriptions, create 3 distinct meta descriptions that:
-       - Each contains the primary keyword once
-       - Each contains 2-3 different secondary keywords
-       - Are between 150-160 characters in length
-       - Have different sentence structures and focuses
-
-The wordpress_slug should be an English-language URL-friendly version that:
-- Closely matches high-volume search terms in your market
-- Is concise (3-5 words maximum)
-- Includes the year (2025) and main topic (crypto/altcoin)
-- Focuses on the investment aspect (e.g., "best-crypto-investments-2025")
+10. Chunk Context: This is a chunk of a larger document. Do not add or remove wrapper tags. Do not try to close tags started in other chunks.
 
 Content to translate:
 {text}
 
-Return ONLY the JSON object, with no extra text or commentary."""
+Return ONLY the JSON object, no commentary."""
     
-    client_config = init_openrouter_client()
+    # Add extra context if provided
+    if extra_context:
+        prompt += f"\n\nCONTEXT:\n{extra_context}"
+
+    # Get config
+    try:
+        config = get_openrouter_config()
+    except Exception:
+        return None
     
     for attempt in range(max_retries):
-        st.info(f"Chunk processing attempt {attempt + 1}/{max_retries}...") # Log attempt start
         try:
-            st.info(f"Making API request (Timeout: {240}s)...") # Log before request
             response = requests.post(
-                url=client_config['api_url'],
+                url=config['api_url'],
                 headers={
-                    "Authorization": f"Bearer {client_config['api_key']}",
+                    "Authorization": f"Bearer {config['api_key']}",
                     "Content-Type": "application/json"
                 },
                 data=json.dumps({
-                    "model": client_config['default_model'],
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ]
+                    "model": config['default_model'],
+                    "messages": [{"role": "user", "content": prompt}]
                 }),
                 timeout=240
             )
             
-            st.info(f"API request completed with status: {response.status_code}") # Log after request
-            response.raise_for_status()
-            resp_data = response.json()
-            
+            # Check for rate limiting
             if response.status_code == 429:
                 wait_time = int(response.headers.get('Retry-After', 60))
-                st.warning(f"Rate limited. Waiting {wait_time} seconds before retrying...")
                 time.sleep(wait_time)
                 continue
             
+            response.raise_for_status()
+            resp_data = response.json()
+            
             if not resp_data or 'choices' not in resp_data or not resp_data['choices']:
-                st.error(f"Invalid response format. Attempt {attempt+1}/{max_retries}")
                 if attempt == max_retries - 1:
                     return None
                 time.sleep(2)
                 continue
+            
+            raw_text = resp_data['choices'][0]['message']['content']
+            parsed = extract_json_safely(raw_text)
+            
+            if parsed:
+                # Add wordpress_slug if missing
+                if 'wordpress_slug' not in parsed and parsed.get('titles') and parsed['titles']:
+                    parsed['wordpress_slug'] = create_slug(parsed['titles'][0])
+                elif not parsed.get('wordpress_slug'):
+                    parsed['wordpress_slug'] = "translated-post"
                 
-            resp_text = resp_data['choices'][0]['message']['content']
-            st.info("Received API response content.") # Log response received
+                parsed['translated_html'] = html.unescape(parsed.get('translated_html', ''))
+                return parsed
             
-        except requests.exceptions.HTTPError as http_err:
-            st.error(f"HTTP Error: {http_err} - Attempt {attempt + 1}/{max_retries}")
-            # Log the response content if available, as it might contain useful error details
-            try:
-                error_details = response.json()
-                st.error(f"API Error Details: {error_details}")
-            except json.JSONDecodeError:
-                st.error(f"API Response Content (non-JSON): {response.text[:500]}") # Log first 500 chars
+            # If parsing failed, retry
+            time.sleep(2)
             
-            st.warning(f"Retrying after HTTP error (attempt {attempt + 1})...") # Log before retry
+        except Exception:
             if attempt == max_retries - 1:
-                st.error("Max retries reached after HTTP error.")
                 return None
-        except requests.exceptions.RequestException as e:
-            st.error(f"API Request failed: {str(e)} - Attempt {attempt + 1}/{max_retries}")
-            
-            st.warning(f"Retrying after request exception (attempt {attempt + 1})...") # Log before retry
-            if attempt == max_retries - 1:
-                st.error("Max retries reached after request exception.")
-                return None
-
-        if not resp_text:
-            st.error(f"Empty response from API. Attempt {attempt+1}/{max_retries}")
-            
-            st.warning(f"Retrying after empty response (attempt {attempt + 1})...") # Log before retry
-            if attempt == max_retries - 1:
-                st.error("Max retries reached after empty response.")
-                return None
-
-        st.info("Attempting to extract JSON...") # Log before extraction
-        result = extract_json_safely(resp_text)
-        if result is None:
-            st.error(f"Failed to extract JSON on attempt {attempt+1}/{max_retries}. Preview: {st.session_state.get('debug_log', 'N/A')}")
-            
-            st.warning(f"Retrying after JSON extraction failure (attempt {attempt + 1})...") # Log before retry
-            if attempt == max_retries - 1:
-                st.error("Max retries reached after JSON extraction failure.")
-                return None
-
-        st.info("Checking for missing fields...") # Log before field check
-        required = ['translated_html', 'titles', 'meta_descriptions', 'alt_text']
-        optional = ['wordpress_slug']
-        
-        missing = [field for field in required if field not in result]
-        if missing:
-            st.error(f"Missing required fields: {missing} Attempt {attempt+1}/{max_retries}")
-            
-            st.warning(f"Retrying after missing fields (attempt {attempt + 1})...") # Log before retry
-            if attempt == max_retries - 1:
-                st.error("Max retries reached after missing fields.")
-                return None
-            
-        # Add wordpress_slug if missing
-        if 'wordpress_slug' not in result and result.get('titles') and result['titles']:
-            # Create a simple slug from the first title
-            from re import sub
-            title = result['titles'][0]
-            result['wordpress_slug'] = sub(r'[^\w\s-]', '', title.lower())
-            result['wordpress_slug'] = sub(r'[\s-]+', '-', result['wordpress_slug'])
-
-        result['translated_html'] = html.unescape(result['translated_html'])
-        st.success(f"Chunk processing successful on attempt {attempt + 1}.") # Log success
-        return result
-        
-    st.error("Chunk processing failed after all retries.") # Log overall failure
+            time.sleep(2)
+    
     return None
 
 def is_wordpress_gutenberg_content(content: str) -> bool:
@@ -743,7 +985,7 @@ def smart_chunk_wordpress_content(content: str, max_length: int) -> list:
     
     return chunks
 
-def translate_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=None, max_level=3):
+def translate_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=None, max_level=3, extra_context=""):
     """
     Attempts to translate a chunk using _translate_single.
     If translation fails and max_level is not exceeded, the chunk is split intelligently.
@@ -752,7 +994,7 @@ def translate_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=
     secondary_keywords = secondary_keywords or []
     
     # First attempt: try to translate the whole chunk
-    result = _translate_single(chunk, primary_keyword, secondary_keywords)
+    result = _translate_single(chunk, primary_keyword, secondary_keywords, extra_context=extra_context)
     if result is not None:
         return result
     
@@ -805,7 +1047,7 @@ def translate_chunk_with_fallback(chunk, primary_keyword="", secondary_keywords=
         chunk2 = chunk[mid:]
     
     # Try to translate each half recursively
-    result1 = translate_chunk_with_fallback(chunk1, primary_keyword, secondary_keywords, max_level-1)
+    result1 = translate_chunk_with_fallback(chunk1, primary_keyword, secondary_keywords, max_level-1, extra_context=extra_context)
     result2 = translate_chunk_with_fallback(chunk2, "", secondary_keywords, max_level-1)
     
     # If either half failed, the whole chunk fails
@@ -876,12 +1118,23 @@ def smart_chunk_html(html_content: str, max_length: int) -> list:
     
     return chunks
 
-def translate_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, max_workers: int = 1) -> dict:
+def translate_content(content: str, primary_keyword: str = "", secondary_keywords: list = None, max_workers: int = 1, source_post_data: dict = None) -> dict:
     """
     Translate HTML content. If content is too long, split it into chunks,
     translate each using fallback logic, and combine results.
     """
     secondary_keywords = secondary_keywords or []
+    
+    # Extract source metadata if available
+    source_title = ""
+    source_meta = ""
+    source_slug = ""
+    if source_post_data:
+        source_title = source_post_data.get('title', {}).get('rendered', "")
+        source_slug = source_post_data.get('slug', "")
+        if 'yoast_head_json' in source_post_data:
+            source_meta = source_post_data['yoast_head_json'].get('description', "")
+    
     content_hash = hashlib.md5(content.encode()).hexdigest()
     keywords_hash = hashlib.md5(f"{primary_keyword}{''.join(secondary_keywords)}".encode()).hexdigest()
     cache_key = f"translation_cache_{content_hash}_{keywords_hash}"
@@ -912,8 +1165,16 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         else:
             CHUNK_LIMIT = 15000  # Increased to reduce number of chunks
     
+    # Pass source metadata context for the first chunk
+    extra_context = ""
+    if source_title or source_meta or source_slug:
+        extra_context = "\n\nORIGINAL SEO METADATA (for context):\n"
+        if source_title: extra_context += f"Title: {source_title}\n"
+        if source_meta: extra_context += f"Meta Description: {source_meta}\n"
+        if source_slug: extra_context += f"Original Slug: {source_slug}\n"
+
     if total_length <= CHUNK_LIMIT:
-        result = translate_chunk_with_fallback(content, primary_keyword, secondary_keywords)
+        result = translate_chunk_with_fallback(content, primary_keyword, secondary_keywords, extra_context=extra_context)
         if result:
             # Sanitize HTML to remove emojis / unnecessary spans
             result['translated_html'] = clean_html_output(result['translated_html'])
@@ -948,7 +1209,13 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
             if primary_keyword and not primary_keyword_inserted and i == 0:
                 # Note: we don't modify primary_keyword_inserted here to avoid race; we just apply it to i==0
                 chunk_primary = primary_keyword
-            return _translate_single(chunk, chunk_primary, secondary_keywords)
+            
+            # Pass source metadata context for the first chunk
+            chunk_context = ""
+            if i == 0 and extra_context:
+                chunk_context = extra_context
+                
+            return translate_chunk_with_fallback(chunk, chunk_primary, secondary_keywords, extra_context=chunk_context)
 
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
             future_map = {executor.submit(submit_task, i, chunk): i for i, chunk in enumerate(chunks)}
@@ -956,9 +1223,9 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                 i = future_map[future]
                 try:
                     result = future.result()
-                except Exception as e:
+                except Exception:
                     result = None
-                    st.error(f"Chunk {i+1} failed with exception: {e}")
+                
                 if result is None:
                     failed_chunks.append(i)
                 else:
@@ -977,6 +1244,9 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
                 progress_value = completed / actual_chunks if actual_chunks else 0.0
                 progress_bar.progress(min(1.0, max(0.0, progress_value)))
                 status_text.text(f"Translated {completed}/{actual_chunks} chunks...")
+
+        if failed_chunks:
+            st.warning(f"Note: {len(failed_chunks)} chunks failed initial translation and will be retried.")
 
         progress_bar.progress(1.0)
         # Add retry logic for failed chunks with simplified parameters
@@ -1049,42 +1319,112 @@ def translate_content(content: str, primary_keyword: str = "", secondary_keyword
         st.session_state[cache_key] = final_result
         return final_result
 
-# Initialize translation history cache and debug log
-if 'history' not in st.session_state:
-    st.session_state['history'] = []
-    
-if 'debug_log' not in st.session_state:
-    st.session_state['debug_log'] = ""
-
-# Initialize OpenRouter client
-try:
-    openrouter_config = init_openrouter_client()
-    st.sidebar.success(f"Using model: {openrouter_config['default_model']}")
-except Exception as e:
-    st.error(f"Failed to initialize OpenRouter client: {str(e)}")
-    st.stop()
+# --- 1. Notification Area (Survives reruns) ---
+if st.session_state.get('last_success'):
+    st.success(st.session_state['last_success'])
+    # Don't clear immediately, let it stay for the current rerun
+if st.session_state.get('last_error'):
+    st.error(st.session_state['last_error'])
 
 # Streamlit UI
 st.title("Crypto HTML Translation")
 st.subheader("Thai Crypto Journalist Translation Tool")
 
-upload_method = st.radio("Choose input method:", ["Text Input", "File Upload"])
-html_input = ""
-if upload_method == "Text Input":
-    html_input = st.text_area("Enter HTML content to translate:", height=200)
-else:
-    uploaded_file = st.file_uploader("Upload HTML file", type=['html', 'htm', 'txt'])
-    if uploaded_file:
-        html_input = uploaded_file.getvalue().decode('utf-8')
-        st.success(f"Loaded file: {uploaded_file.name} ({len(html_input)} characters)")
-        with st.expander("Preview uploaded content"):
-            st.code(html_input[:500] + "..." if len(html_input) > 500 else html_input, language="html")
+# Workflow Status Banner
+step = st.session_state['workflow_step']
+if step == 'idle':
+    st.info("💡 **Status: Ready** - Start by fetching a WordPress post or entering HTML manually.")
+elif step == 'fetched':
+    st.success("✅ **Status: Content Fetched** - WordPress content is loaded. Adjust keywords and click Translate.")
+elif step == 'translated':
+    st.success("🎨 **Status: Translated** - Review the translation below. You can now publish to WordPress.")
+elif step == 'published':
+    st.success("🚀 **Status: Published** - The draft has been created on the Thai site.")
 
-# Multi-keyword input (one per line)
+# --- 2. Input Selection Section ---
+if 'input_method_selector' not in st.session_state:
+    st.session_state['input_method_selector'] = "Text Input"
+
+upload_method = st.radio(
+    "Choose input method:", 
+    ["Text Input", "File Upload", "WordPress Fetch"], 
+    key="input_method_selector"
+)
+html_input = ""
+
+if upload_method == "WordPress Fetch":
+    # Show WordPress Automation inside here
+    fetch_expanded = st.session_state['workflow_step'] in ['idle', 'fetched']
+    with st.expander("WordPress Automation", expanded=fetch_expanded):
+        # Site selection dropdown
+        site_options = ["cryptodnes.bg", "icobench.com"]
+        selected_site = st.selectbox("Select WordPress Site:", site_options, key="wp_site_selector", index=0)
+        
+        # Store selected site in session state
+        st.session_state['selected_site'] = 'icobench' if selected_site == "icobench.com" else 'cryptodnes'
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            # Update default URL based on selected site
+            default_url = "https://icobench.com/en/" if selected_site == "icobench.com" else "https://cryptodnes.bg/en/terms-of-use/"
+            wp_url_input = st.text_input("Paste English Post/Page URL:", value=default_url, key="wp_url_input")
+        with col2:
+            wp_id_input = st.text_input("OR Post ID:", placeholder="187200", key="wp_id_input")
+            
+        if st.button("Fetch Content from WordPress"):
+            if not wp_url_input and not wp_id_input:
+                st.error("Please enter a URL or Post ID")
+            else:
+                with st.spinner("Fetching post data..."):
+                    # Clear results but keep previous history
+                    st.session_state['translation_result'] = None
+                    st.session_state['publish_result'] = None
+                    st.session_state['publish_error'] = None
+                    st.session_state['last_success'] = None
+                    st.session_state['last_error'] = None
+                    
+                    # Try to extract ID
+                    extracted_id = wp_id_input
+                    if not extracted_id and wp_url_input and 'post=' in wp_url_input:
+                        try:
+                            extracted_id = re.search(r'post=(\d+)', wp_url_input).group(1)
+                        except: pass
+                    
+                    try:
+                        post_data = fetch_wp_post_by_url(wp_url_input, post_id=extracted_id)
+                        if post_data:
+                            title_text = update_session_state_with_post_data(post_data)
+                            st.session_state['workflow_step'] = 'fetched'
+                            st.session_state['last_success'] = f"Fetched: {title_text}"
+                            st.rerun()
+                    except Exception as e:
+                        st.session_state['last_error'] = str(e)
+                        st.rerun()
+
+    if st.session_state['wp_post_data']:
+        html_input = st.session_state['html_input']
+        title_text = st.session_state['wp_post_data'].get('title', {}).get('rendered', 'Untitled')
+        st.info(f"Using content from fetched WordPress post: {title_text}")
+    else:
+        st.warning("No WordPress post fetched yet.")
+elif upload_method == "Text Input":
+    html_input = st.text_area("Enter HTML content to translate:", height=200, key="html_input")
+else:
+    uploaded_file = st.file_uploader("Upload HTML file", type=['html', 'htm', 'txt'], key="html_file_uploader")
+    if uploaded_file:
+        content = uploaded_file.getvalue().decode('utf-8')
+        if content != st.session_state['html_input']:
+            st.session_state['html_input'] = content
+            st.session_state['translation_result'] = None
+            st.session_state['workflow_step'] = 'idle'
+    html_input = st.session_state['html_input']
+
+# Multi-keyword input
 keyword_input = st.text_area(
     "Keywords (one per line, first keyword is primary):",
-    placeholder="Primary keyword\nSecondary keyword 1\nSecondary keyword 2",
-    height=100
+    placeholder="Primary keyword\nSecondary keyword 1",
+    height=100,
+    key="auto_keywords"
 )
 
 # Parse keywords
@@ -1092,148 +1432,179 @@ keywords = [k.strip() for k in keyword_input.split('\n') if k.strip()]
 primary_keyword = keywords[0] if keywords else ""
 secondary_keywords = keywords[1:] if len(keywords) > 1 else []
 
-# Display parsed keywords for clarity
-if keywords:
-    st.info(f"Primary keyword: {primary_keyword}")
-    if secondary_keywords:
-        st.info(f"Secondary keywords: {', '.join(secondary_keywords)}")
-
 with st.expander("Advanced Options"):
     st.info("These settings help optimize translation of very large documents.")
-    save_intermediate = st.checkbox("Save intermediate results (recommended for large files)", value=True)
-    concurrency = st.slider("Parallel requests (higher is faster but may hit rate limits)", min_value=1, max_value=8, value=3)
-    clear_cache = st.button("Clear cache")
-    
-    if clear_cache:
+    save_intermediate = st.checkbox("Save intermediate results (recommended for large files)", value=True, key="save_intermediate_check")
+    concurrency = st.slider("Parallel requests", min_value=1, max_value=8, value=3, key="concurrency_slider")
+    if st.button("Clear Translation Cache", key="clear_cache_btn"):
         cache_keys = [k for k in st.session_state.keys() if k.startswith('translation_cache_')]
-        for key in cache_keys:
-            del st.session_state[key]
+        for key in cache_keys: del st.session_state[key]
         st.success("Cache cleared!")
 
-if st.button("Translate"):
+# --- 4. Translation Trigger ---
+if st.button("Translate", type="primary"):
     if not html_input:
         st.error("Please enter HTML content to translate")
     else:
-        line_count = html_input.count('\n') + 1
-        char_count = len(html_input)
-        tag_count = len(re.findall(r'<[^>]+>', html_input))
+        # Clear previous notifications
+        st.session_state['last_success'] = None
+        st.session_state['last_error'] = None
         
-        st.info(f"Document stats: {line_count} lines, {char_count} characters, approximately {tag_count} HTML tags")
-        
-        start_time = time.time()
-        with st.spinner("Analyzing document..."):
+        with st.spinner("Translating..."):
             try:
-                result = translate_content(html_input, primary_keyword, secondary_keywords, max_workers=concurrency)
-            except Exception as e:
-                st.error(f"Translation failed: {str(e)}")
-                result = None
-
-            end_time = time.time()
-            process_time = end_time - start_time
-
-            if result:
-                st.success(f"Translation complete in {process_time:.1f} seconds!")
-                # Output vs Input comparison (rows/lines, characters, and HTML tags)
-                out_html = result['translated_html']
-                out_line_count = out_html.count('\n') + 1
-                out_char_count = len(out_html)
-                out_tag_count = len(re.findall(r'<[^>]+>', out_html))
-
-                # Avoid division by zero
-                line_ratio = (out_line_count / line_count) if line_count else 1.0
-                char_ratio = (out_char_count / char_count) if char_count else 1.0
-                tag_ratio = (out_tag_count / tag_count) if tag_count else 1.0
-
-                st.info(
-                    f"Output stats: {out_line_count} lines, {out_char_count} characters, approximately {out_tag_count} HTML tags\n"
-                    f"Ratios vs input → Lines: {line_ratio:.2f}×, Chars: {char_ratio:.2f}×, Tags: {tag_ratio:.2f}×"
+                wp_post_data = st.session_state.get('wp_post_data')
+                result = translate_content(
+                    html_input, 
+                    primary_keyword, 
+                    secondary_keywords, 
+                    max_workers=concurrency,
+                    source_post_data=wp_post_data
                 )
+                
+                if result:
+                    st.session_state['translation_result'] = result
+                    st.session_state['translation_html_input'] = html_input
+                    st.session_state['translation_primary_keyword'] = primary_keyword
+                    st.session_state['translation_secondary_keywords'] = secondary_keywords
+                    st.session_state['workflow_step'] = 'translated'
+                    st.session_state['last_success'] = "Translation complete!"
+                    st.session_state['publish_result'] = None
+                    
+                    # Record in history
+                    history_entry = {
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'input_length': len(html_input),
+                        'output_length': len(result['translated_html']),
+                        'keyword': primary_keyword if primary_keyword else "None",
+                    }
+                    if 'history' not in st.session_state: st.session_state['history'] = []
+                    st.session_state['history'].append(history_entry)
+                    
+                    st.rerun()
+            except Exception as e:
+                st.session_state['last_error'] = f"Translation failed: {str(e)}"
+                st.rerun()
 
-                # Shortcode and structure checks
-                shortcode_pattern = r"\[[^\[\]]+\]"
-                in_shortcodes = re.findall(shortcode_pattern, html_input)
-                out_shortcodes = re.findall(shortcode_pattern, out_html)
-                if in_shortcodes:
-                    st.info(f"Shortcodes: input {len(in_shortcodes)} → output {len(out_shortcodes)}")
-                    if len(out_shortcodes) < len(in_shortcodes):
-                        st.warning("⚠️ Some shortcodes may be missing in the output.")
+# --- 5. Persistent Results Display ---
+if st.session_state['workflow_step'] in ['translated', 'published'] and st.session_state['translation_result']:
+    result = st.session_state['translation_result']
+    html_input = st.session_state['translation_html_input']
+    
+    # Render stats, ratios, and previews
+    st.divider()
+    st.subheader("Translation Results")
+    
+    # Detailed Stats
+    def normalize_html(h): return re.sub(r'\s+', ' ', h).strip()
+    norm_in = normalize_html(html_input)
+    norm_out = normalize_html(result['translated_html'])
+    
+    in_lines, out_lines = html_input.count('\n')+1, result['translated_html'].count('\n')+1
+    in_chars, out_chars = len(norm_in), len(norm_out)
+    in_tags = len(re.findall(r'<[^>]+>', norm_in))
+    out_tags = len(re.findall(r'<[^>]+>', norm_out))
+    
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Lines", f"{out_lines}", f"{out_lines - in_lines} diff")
+    col_b.metric("Characters", f"{out_chars}", f"{out_chars - in_chars} diff")
+    col_c.metric("HTML Tags", f"{out_tags}", f"{out_tags - in_tags} diff")
 
-                # Warn if output appears significantly shorter than input
-                # Use chars/tags as stronger signal than lines (which can change due to formatting)
-                if (char_ratio < 0.90) or (tag_ratio < 0.90):
-                    st.warning(
-                        "⚠️ The translated output is significantly smaller by characters or tag count. "
-                        "This could indicate content omission by the model."
-                    )
-                
-                history_entry = {
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'input_length': len(html_input),
-                    'output_length': len(result['translated_html']),
-                    'keyword': primary_keyword if primary_keyword else "None",
-                    'process_time': process_time
-                }
-                st.session_state['history'].append(history_entry)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label="Download HTML",
-                        data=result['translated_html'],
-                        file_name="translated.html",
-                        mime="text/html"
-                    )
-                with col2:
-                    json_data = json.dumps(result, ensure_ascii=False, indent=2)
-                    st.download_button(
-                        label="Download JSON (All Results)",
-                        data=json_data,
-                        file_name="translation_results.json",
-                        mime="application/json"
-                    )
-                
-                with st.expander("Translated HTML Content", expanded=True):
-                    st.code(result['translated_html'], language='html')
-                
-                with st.expander("SEO Elements", expanded=True):
-                    st.write("Titles:", result['titles'])
-                    st.write("Meta Descriptions:", result['meta_descriptions'])
-                    st.write("Alt Text:", result['alt_text'])
-                    st.write("WordPress Slug:", result.get('wordpress_slug', ''))
-                
-                # Keyword usage analysis
-                if primary_keyword:
-                    primary_count = result['translated_html'].lower().count(primary_keyword.lower())
-                    if primary_count == 0:
-                        st.warning(f"⚠️ Primary keyword '{primary_keyword}' is missing from the translation!")
-                    else:
-                        st.info(f"✅ Primary keyword '{primary_keyword}' appears {primary_count} times in the translated content.")
-                
-                # Check for missing secondary keywords
-                missing_keywords = []
-                for sec_keyword in secondary_keywords:
-                    sec_count = result['translated_html'].lower().count(sec_keyword.lower())
-                    if sec_count == 0:
-                        missing_keywords.append(sec_keyword)
-                        st.warning(f"⚠️ Secondary keyword '{sec_keyword}' is missing from the translation!")
-                    else:
-                        st.info(f"✅ Secondary keyword '{sec_keyword}' appears {sec_count} times in the translated content.")
-                
-                # Summary of keyword coverage
-                if secondary_keywords:
-                    coverage = ((len(secondary_keywords) - len(missing_keywords)) / len(secondary_keywords)) * 100
-                    if coverage == 100:
-                        st.success(f"🎯 All keywords successfully integrated in the translation!")
-                    else:
-                        st.info(f"Keyword coverage: {coverage:.1f}% ({len(secondary_keywords) - len(missing_keywords)}/{len(secondary_keywords)} keywords)")
+    if in_tags > 0 and (out_tags / in_tags) < 0.85:
+        st.warning("⚠️ The translated output has significantly fewer HTML tags than the original.")
 
+    col1, col2 = st.columns(2)
+    with col1: st.download_button("Download HTML", result['translated_html'], "translated.html", "text/html")
+    with col2: st.download_button("Download JSON", json.dumps(result, ensure_ascii=False, indent=2), "result.json", "application/json")
+    
+    # Preview
+    st.subheader("Side-by-Side Preview")
+    c_orig, c_trans = st.columns(2)
+    with c_orig:
+        st.markdown("#### Original")
+        components.html(html_input, height=500, scrolling=True)
+    with c_trans:
+        st.markdown("#### Translated")
+        components.html(result['translated_html'], height=500, scrolling=True)
+
+    # --- 6. WordPress Publishing (Persistent) ---
+    if st.session_state['wp_post_data']:
+        st.divider()
+        st.subheader("WordPress Publishing")
+        
+        # Extracted categories/tags
+        en_categories = []
+        en_tags = []
+        wp_data = st.session_state['wp_post_data']
+        if '_embedded' in wp_data and 'wp:term' in wp_data['_embedded']:
+            for term_list in wp_data['_embedded']['wp:term']:
+                for term in term_list:
+                    if term.get('taxonomy') == 'category': en_categories.append(term['name'])
+                    elif term.get('taxonomy') == 'post_tag': en_tags.append(term['name'])
+        
+        st.info(f"Syncing categories: {', '.join(en_categories)} | Tags: {', '.join(en_tags)}")
+
+        # Get the selected site from session state or default to cryptodnes
+        selected_site = st.session_state.get('selected_site', 'cryptodnes')
+        site_display = "ICOBench.com/th" if selected_site == 'icobench' else "Cryptodnes.bg/th"
+        
+        if st.button(f"Publish Draft to {site_display}", type="secondary"):
+            # Clear previous notifications
+            st.session_state['last_success'] = None
+            st.session_state['last_error'] = None
+            
+            with st.spinner("Publishing to WordPress..."):
+                try:
+                    # Get the selected site
+                    selected_site = st.session_state.get('selected_site', 'cryptodnes')
+                    
+                    th_cat_ids = [get_or_create_th_category(c, selected_site) for c in en_categories if get_or_create_th_category(c, selected_site)]
+                    th_tag_ids = [get_or_create_th_tag(t, selected_site) for t in en_tags if get_or_create_th_tag(t, selected_site)]
+                    
+                    en_media_url = ""
+                    if '_embedded' in wp_data and 'wp:featuredmedia' in wp_data['_embedded']:
+                        en_media_url = wp_data['_embedded']['wp:featuredmedia'][0].get('source_url', "")
+                    
+                    th_media_id = upload_media_to_wp_th(en_media_url, title=result['titles'][0], site=selected_site) if en_media_url else None
+                    
+                    source_type = wp_data.get('type', 'post')
+                    source_format = wp_data.get('format', 'standard')
+                    
+                    pub_result = publish_to_wp_th(
+                        result, 
+                        categories=th_cat_ids, 
+                        tags=th_tag_ids, 
+                        featured_media_id=th_media_id, 
+                        post_type=source_type, 
+                        format=source_format,
+                        site=selected_site
+                    )
+                    
+                    if pub_result:
+                        st.session_state['publish_result'] = pub_result
+                        st.session_state['workflow_step'] = 'published'
+                        st.session_state['last_success'] = "✅ Successfully published as draft!"
+                        st.balloons()
+                    else:
+                        st.session_state['last_error'] = "Failed to publish draft. Check logs."
+                    st.rerun()
+                except Exception as e:
+                    st.session_state['last_error'] = f"Publish error: {str(e)}"
+                    st.rerun()
+
+        # Show Persistent Publish Success
+        if st.session_state['publish_result']:
+            pr = st.session_state['publish_result']
+            st.success(f"Draft Created! ID: {pr.get('id')}")
+            st.markdown(f"**Preview:** [{pr.get('link')}]({pr.get('link')})")
+            
+            # Get the selected site for edit URL
+            selected_site = st.session_state.get('selected_site', 'cryptodnes')
+            config = get_wp_config(selected_site)
+            edit_url = f"{config['url']}/wp-admin/post.php?post={pr.get('id')}&action=edit"
+            st.markdown(f"**📝 Edit in WordPress:** [{edit_url}]({edit_url})")
+
+# History in Sidebar
 with st.sidebar.expander("Translation History"):
-    if not st.session_state['history']:
-        st.write("No translations yet")
-    else:
-        for i, entry in enumerate(st.session_state['history']):
-            st.write(f"**{entry['timestamp']}**")
-            st.write(f"Size: {entry['input_length']} → {entry['output_length']} chars")
-            st.write(f"Keyword: {entry['keyword']}")
-            st.write(f"Time: {entry['process_time']:.1f} seconds")
-            st.write("---")
+    for entry in st.session_state['history'][::-1]:
+        st.write(f"**{entry['timestamp']}** | {entry['keyword']}")
+        st.write("---")
